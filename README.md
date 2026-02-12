@@ -33,8 +33,8 @@ Raw data files are not publicly included due to privacy restrictions.
 * Visualization using volcano plots and heatmaps
 
 3. Co-expression Network Analysis (WGCNA)
-i) Construction of scale-free gene co-expression networks
-ii) Identification of gene modules
+Step 1: Construction of scale-free gene co-expression networks
+Step 2: Identification of gene modules 
 iii) Calculation of:
 - Module eigengenes (ME)
 - Module membership (MM)
