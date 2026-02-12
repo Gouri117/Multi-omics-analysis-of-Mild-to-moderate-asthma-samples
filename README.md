@@ -57,4 +57,4 @@ Raw data files are not publicly included due to privacy restrictions.
 
 3. Are there modules that distinguish steroid-responsive vs non-responsive patients?
 
-Can network-level signals explain heterogeneity beyond DE genes?
+4. Can network-level signals explain heterogeneity beyond DE genes?
