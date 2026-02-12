@@ -1,0 +1,449 @@
+---
+title: "rnaseq"
+author: "Gouri Anil"
+date: "2025-05-03"
+output: html_document
+---
+Step 1: Load libraries
+```{r}
+library(dplyr)
+library(magrittr)
+library(tidyverse)
+library(DESeq2)
+library(ggplot2)
+```
+
+
+
+Step 2: Load Data and Preprocess it
+```{r}
+# Counts data
+counts_data <- read.csv("all_counts.csv", stringsAsFactors = FALSE) %>%
+  na.omit() %>%
+  group_by(Gene = .[[1]]) %>%
+  summarise(across(-1, ~ round(sum(.)))) %>%
+  as.data.frame() %>%
+  {rownames(.) <- .$Gene; .[, -1]}
+
+# Metadata
+metadata <- read.csv("metadata.csv", row.names = 1)
+
+
+# Step 2: Make sure all the row names in the colData matches to the column names in the counts_data
+all(colnames(counts_data) %in% rownames(colData))
+
+# Make them in the same order
+all(colnames(counts_data) == rownames(colData))
+```
+
+Step 3: Convert the variables into factors
+```{r}
+metadata$Status <- factor(metadata$status, levels = c("Healthy", "Asthma"))
+metadata$T2_Status <- factor(metadata$T2_Status, levels = c("Low", "High"))  # healthy NA stays NA
+metadata$Patient_Type <- factor(metadata$Patient_Type, levels = c("ATH", "ACS"))  # healthy NA stays NA
+```
+
+Step 4: Asthma vs Healthy
+```{r}
+# Parameters and Output Folder
+# -----------------------------#
+logFC_thresh <- 1
+pval_thresh <- 0.1
+dir.create("GO_Plots", showWarnings = FALSE)
+
+# -----------------------------#
+# Step 1: Construct DESeqDataSet
+# -----------------------------#
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_data,
+  colData = metadata,
+  design = ~ status
+)
+
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+dds$status <- relevel(dds$status, ref = "Healthy")
+dds <- DESeq(dds)
+
+# -----------------------------#
+# Step 2: Get DE results
+# -----------------------------#
+res <- results(dds, contrast = c("status", "Asthma", "Healthy"))
+res_df <- as.data.frame(res)
+res_df <- res_df[!is.na(res_df$pvalue), ]
+res_df$neglog10_pvalue <- -log10(res_df$pvalue)
+
+# -----------------------------#
+# Step 3: Volcano thresholding and save gene lists
+# -----------------------------#
+res_df$threshold <- "Not Significant"
+res_df$threshold[res_df$padj < pval_thresh & res_df$log2FoldChange > logFC_thresh] <- "Upregulated"
+res_df$threshold[res_df$padj < pval_thresh & res_df$log2FoldChange < -logFC_thresh] <- "Downregulated"
+
+upreg_genes <- rownames(res_df)[res_df$threshold == "Upregulated"]
+downreg_genes <- rownames(res_df)[res_df$threshold == "Downregulated"]
+
+# -----------------------------#
+# Step 4: Volcano Plot
+# -----------------------------#
+label_genes <- res_df %>% filter(log2FoldChange > 4 | neglog10_pvalue > 6.5)
+
+volcano <- ggplot(res_df, aes(x = log2FoldChange, y = neglog10_pvalue, color = threshold)) +
+  geom_point(alpha = 0.6) +
+  geom_text_repel(data = label_genes, aes(label = rownames(label_genes)), size = 3) +
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-logFC_thresh, logFC_thresh), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(pval_thresh), linetype = "dashed", color = "black") +
+  labs(title = "Volcano Plot, Asthma vs Healthy Samples",
+       x = "Log2 Fold Change",
+       y = "-Log10(P-value)") +
+  theme_minimal()
+volcano
+```
+Step 4: T2_Hgh and T2_Low 
+```{r}
+# --------------------------T2_Hgh vs  T2_Low-------------
+metadata$T2_Group <- as.character(metadata$T2_Status)
+metadata$T2_Group[is.na(metadata$T2_Group)] <- "Healthy"
+metadata$T2_Group <- factor(metadata$T2_Group, levels = c("Healthy", "Low", "High"))
+
+
+dds2 <- DESeqDataSetFromMatrix(countData = counts_data,
+                               colData = metadata,
+                               design = ~ T2_Group)
+dds2 <- DESeq(dds2)
+res_T2High_vs_T2Low <- results(dds2, contrast = c("T2_Group", "High", "Low"))
+res_T2High_vs_T2Low_df <- as.data.frame(res_T2High_vs_T2Low)
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+
+# ------------------------- Define Thresholds --------------------------
+logFC_thresh <- 1     # log2 fold change cutoff
+pval_thresh <- 0.1    # p-value cutoff
+
+# ------------------------ Convert DESeqResults ------------------------
+# Compute -log10(p-value)
+res_T2High_vs_T2Low_df$neglog10_pvalue <- -log10(res_T2High_vs_T2Low_df$pvalue)
+# Add threshold category
+res_T2High_vs_T2Low_df <- res_T2High_vs_T2Low_df %>%
+  mutate(threshold = case_when(
+    log2FoldChange > logFC_thresh & pvalue < pval_thresh ~ "Upregulated",
+    log2FoldChange < -logFC_thresh & pvalue < pval_thresh ~ "Downregulated",
+    TRUE ~ "Not Significant"
+  ))
+# ------------------------ Save Top Genes -------------------------
+top_up <- res_T2High_vs_T2Low_df %>%
+  filter(threshold == "Upregulated") %>%
+  top_n(10, wt = log2FoldChange)
+
+top_down <- res_T2High_vs_T2Low_df %>%
+  filter(threshold == "Downregulated") %>%
+  top_n(10, wt = -log2FoldChange)
+
+# write.csv(top_up, "top_upregulated_genes.csv", row.names = FALSE, quote = FALSE)
+# write.csv(top_down, "top_downregulated_genes.csv", row.names = FALSE, quote = FALSE)
+
+# ------------------------ Label Genes ----------------------------
+
+top_label_up <- res_T2High_vs_T2Low_df %>%
+  filter(threshold == "Upregulated") %>%
+  top_n(5, wt = log2FoldChange)
+
+top_label_down <- res_T2High_vs_T2Low_df %>%
+  filter(threshold == "Downregulated") %>%
+  top_n(5, wt = -log2FoldChange)
+
+# ------------------------ Extreme Upregulated ------------------------
+extreme_up <- res_T2High_vs_T2Low_df %>%
+  filter(threshold == "Upregulated" & 
+         (log2FoldChange > 5 | neglog10_pvalue > 13))
+
+# ------------------------ Extreme Downregulated ------------------------
+extreme_down <- res_T2High_vs_T2Low_df %>%
+  filter(threshold == "Downregulated" & 
+         (log2FoldChange < -4 | neglog10_pvalue > 4))
+
+# ------------------------ Combine Labels ------------------------
+label_genes <- bind_rows(top_label_up, top_label_down, extreme_up, extreme_down) %>%
+  tibble::rownames_to_column("Gene") %>%   # move rownames into a column
+  distinct(Gene, .keep_all = TRUE) %>%
+  tibble::column_to_rownames("Gene")       # put them back as rownames
+
+
+# ------------------------ Volcano Plot ------------------------
+ggplot(res_T2High_vs_T2Low_df, aes(x = log2FoldChange, y = neglog10_pvalue, color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_text(
+    data = tibble::rownames_to_column(label_genes, "Gene"),
+    aes(label = Gene),
+    size = 2.5, vjust = -0.5, check_overlap = TRUE
+  ) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not Significant" = "grey"
+  )) +
+  geom_vline(xintercept = c(-logFC_thresh, logFC_thresh), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(pval_thresh), linetype = "dashed", color = "black") +
+  annotate("text",
+           x = min(res_T2High_vs_T2Low_df$log2FoldChange, na.rm = TRUE),
+           y = -log10(pval_thresh) + 0.2,
+           label = paste0("p = ", pval_thresh),
+           hjust = 0, size = 3) +
+  labs(
+    title = "Volcano Plot: T2-High vs T2-Low",
+    x = "Log2 Fold Change",
+    y = "-Log10(P-value)"
+  ) +
+  theme_minimal(base_size = 12)
+
+
+# 1. Save all upregulated gene names (use rownames)
+up_genes <- res_T2High_vs_T2Low_df %>%
+  tibble::rownames_to_column("Gene") %>%   # move rownames into a column
+  filter(threshold == "Upregulated") %>%
+  pull(Gene)
+
+# 2. Save all downregulated gene names (use rownames)
+down_genes <- res_T2High_vs_T2Low_df %>%
+  tibble::rownames_to_column("Gene") %>% 
+  filter(threshold == "Downregulated") %>%
+  pull(Gene)
+
+```
+
+#ICS Use in Overall
+```{r}
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+
+# Ensure your metadata has a column for ICS use (e.g., "ICS_Status")
+# Here we assume the ICS status is stored in the metadata column 'ICS_Status', where 'Yes' means ICS use and 'No' means no ICS use
+
+# Step 1: Filter data for T2 Low samples
+
+t2_asthma_metadata <- metadata[metadata$Status == "Asthma", ]
+t2_asthma_counts <- counts_data[, colnames(counts_data) %in% rownames(t2_asthma_metadata)]
+
+# Step 2: Create DESeq2 dataset for T2 Low samples with ICS use vs no ICS use
+dds_asthma_ICS <- DESeqDataSetFromMatrix(countData = t2_asthma_counts,
+                                         colData = t2_asthma_metadata,
+                                         design = ~ Patient_Type)
+
+# Step 3: Run DESeq2 analysis
+dds_asthma_ICS <- DESeq(dds_asthma_ICS)
+
+# Step 4: Perform differential expression analysis (ICS use vs no ICS use)
+res_asthma_ICS <- results(dds_asthma_ICS, contrast = c("Patient_Type", "ACS", "ATH"))
+
+# Step 5: Explore results
+summary(res_asthma_ICS) 
+
+# Step 7: Volcano plot with top genes
+res_asthma_ICS_df <- as.data.frame(res_asthma_ICS)
+res_asthma_ICS_df <- res_asthma_ICS_df[!is.na(res_asthma_ICS_df$pvalue), ]
+res_asthma_ICS_df$neglog10_pvalue <- -log10(res_asthma_ICS_df$pvalue)
+
+# Set thresholds for significance
+res_asthma_ICS_df$threshold <- "Not Significant"
+res_asthma_ICS_df$threshold[res_asthma_ICS_df$padj < 0.1 & res_asthma_ICS_df$log2FoldChange > 1] <- "Upregulated"
+res_asthma_ICS_df$threshold[res_asthma_ICS_df$padj < 0.1 & res_asthma_ICS_df$log2FoldChange < -1] <- "Downregulated"
+
+# Select top upregulated and downregulated genes
+top_up_ICS_asthma <- res_asthma_ICS_df[res_asthma_ICS_df$padj < 0.1 & res_asthma_ICS_df$log2FoldChange > 1, ]
+top_up_ICS_asthma <- top_up_ICS_asthma[order(top_up_ICS_asthma$padj), ][1:min(15, nrow(top_up_ICS_asthma)), ]
+
+top_down_ICS_asthma <- res_asthma_ICS_df[res_asthma_ICS_df$padj < 0.1 & res_asthma_ICS_df$log2FoldChange < -1, ]
+top_down_ICS_asthma <- top_down_ICS_asthma[order(top_down_ICS_asthma$padj), ][1:min(15, nrow(top_down_ICS_asthma)), ]
+
+top_genes_ICS_asthma <- rbind(top_up_ICS_asthma, top_down_ICS_asthma)
+
+# Volcano plot with custom styling
+ggplot(res_asthma_ICS_df, aes(x = log2FoldChange, y = neglog10_pvalue, color = threshold)) +
+  geom_point(alpha = 0.6) +
+  geom_text(data = top_genes_ICS_asthma, aes(label = rownames(top_genes_ICS_asthma)), size = 2.5) +  # Reduced label size
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", color = "black") +
+  labs(title = "Volcano Plot: All Samples (ICS Use vs No ICS Use)",
+       x = "Log2 Fold Change",
+       y = "-Log10(P-value)") +
+  theme_minimal()
+
+up_genes_overall_ICS <- res_asthma_ICS_df %>%
+  tibble::rownames_to_column("Gene") %>%   # move rownames into a column
+  filter(threshold == "Upregulated") %>%
+  pull(Gene)
+
+# 2. Save all downregulated gene names (use rownames)
+down_genes_overall_ICS <- res_asthma_ICS_df %>%
+  tibble::rownames_to_column("Gene") %>% 
+  filter(threshold == "Downregulated") %>%
+  pull(Gene)
+
+```
+
+
+# ICS Use in T2 High
+```{r}
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+
+# Ensure your metadata has a column for ICS use (e.g., "ICS_Status")
+# Here we assume the ICS status is stored in the metadata column 'ICS_Status', where 'Yes' means ICS use and 'No' means no ICS use
+
+# Step 1: Filter data for T2 High samples
+t2_high_metadata <- metadata[metadata$T2_Group == "High", ]
+t2_high_counts <- counts_data[, colnames(counts_data) %in% rownames(t2_high_metadata)]
+
+# Step 2: Create DESeq2 dataset for T2 High samples with ICS use vs no ICS use
+dds_T2High_ICS <- DESeqDataSetFromMatrix(countData = t2_high_counts,
+                                         colData = t2_high_metadata,
+                                         design = ~ Patient_Type)
+
+# Step 3: Run DESeq2 analysis
+dds_T2High_ICS <- DESeq(dds_T2High_ICS)
+
+# Step 4: Perform differential expression analysis (ICS use vs no ICS use)
+dds_T2High_ICS <- results(dds_T2High_ICS, contrast = c("Patient_Type", "ACS", "ATH"))
+
+# Step 5: Explore results
+summary(dds_T2High_ICS) 
+
+# Step 7: Volcano plot with top genes
+dds_T2High_ICS_df <- as.data.frame(dds_T2High_ICS)
+dds_T2High_ICS_df <- dds_T2High_ICS_df[!is.na(dds_T2High_ICS_df$pvalue), ]
+dds_T2High_ICS_df$neglog10_pvalue <- -log10(dds_T2High_ICS_df$pvalue)
+
+# Set thresholds for significance
+dds_T2High_ICS_df$threshold <- "Not Significant"
+dds_T2High_ICS_df$threshold[dds_T2High_ICS_df$padj < 0.1 & dds_T2High_ICS_df$log2FoldChange > 1] <- "Upregulated"
+dds_T2High_ICS_df$threshold[dds_T2High_ICS_df$padj < 0.1 & dds_T2High_ICS_df$log2FoldChange < -1] <- "Downregulated"
+
+# Select top upregulated and downregulated genes
+top_up_ICS_T2High <- dds_T2High_ICS_df[dds_T2High_ICS_df$padj < 0.1 & dds_T2High_ICS_df$log2FoldChange > 1, ]
+top_up_ICS_T2High <- top_up_ICS_T2High[order(top_up_ICS_T2High$padj), ][1:min(15, nrow(top_up_ICS_T2High)), ]
+
+top_down_ICS_T2High <- dds_T2High_ICS_df[dds_T2High_ICS_df$padj < 0.1 & dds_T2High_ICS_df$log2FoldChange < -1, ]
+top_down_ICS_T2High <- top_down_ICS_T2High[order(top_down_ICS_T2High$padj), ][1:min(15, nrow(top_down_ICS_T2High)), ]
+
+top_genes_ICS_T2High <- rbind(top_up_ICS_T2High, top_down_ICS_T2High)
+
+# Volcano plot with custom styling
+ggplot(dds_T2High_ICS_df, aes(x = log2FoldChange, y = neglog10_pvalue, color = threshold)) +
+  geom_point(alpha = 0.6) +
+  geom_text(data = top_genes_ICS_T2High, aes(label = rownames(top_genes_ICS_T2High)), size = 2.5) +  # Reduced label size
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", color = "black") +
+  labs(title = "Volcano Plot: T2 High Samples (ICS Use vs No ICS Use)",
+       x = "Log2 Fold Change",
+       y = "-Log10(P-value)") +
+  theme_minimal()
+
+up_genes_high_ICS <- dds_T2High_ICS_df %>%
+  tibble::rownames_to_column("Gene") %>%   # move rownames into a column
+  filter(threshold == "Upregulated") %>%
+  pull(Gene)
+
+# 2. Save all downregulated gene names (use rownames)
+down_genes_high_ICS <- dds_T2High_ICS_df %>%
+  tibble::rownames_to_column("Gene") %>% 
+  filter(threshold == "Downregulated") %>%
+  pull(Gene)
+```
+
+# ICS Use in T2 Low
+```{r}
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+
+# Ensure your metadata has a column for ICS use (e.g., "ICS_Status")
+# Here we assume the ICS status is stored in the metadata column 'ICS_Status', where 'Yes' means ICS use and 'No' means no ICS use
+
+# Step 1: Filter data for T2 Low samples
+t2_low_metadata <- metadata[metadata$T2_Group == "Low", ]
+t2_low_counts <- counts_data[, colnames(counts_data) %in% rownames(t2_low_metadata)]
+
+# Step 2: Create DESeq2 dataset for T2 Low samples with ICS use vs no ICS use
+dds_T2Low_ICS <- DESeqDataSetFromMatrix(countData = t2_low_counts,
+                                         colData = t2_low_metadata,
+                                         design = ~ Patient_Type)
+
+# Step 3: Run DESeq2 analysis
+dds_T2Low_ICS <- DESeq(dds_T2Low_ICS)
+
+# Step 4: Perform differential expression analysis (ICS use vs no ICS use)
+res_T2Low_ICS <- results(dds_T2Low_ICS, contrast = c("Patient_Type", "ACS", "ATH"))
+
+# Step 5: Explore results
+summary(res_T2Low_ICS) 
+
+# Step 7: Volcano plot with top genes
+res_T2Low_ICS_df <- as.data.frame(res_T2Low_ICS)
+res_T2Low_ICS_df <- res_T2Low_ICS_df[!is.na(res_T2Low_ICS_df$pvalue), ]
+res_T2Low_ICS_df$neglog10_pvalue <- -log10(res_T2Low_ICS_df$pvalue)
+
+# Set thresholds for significance
+res_T2Low_ICS_df$threshold <- "Not Significant"
+res_T2Low_ICS_df$threshold[res_T2Low_ICS_df$padj < 0.1 & res_T2Low_ICS_df$log2FoldChange > 1] <- "Upregulated"
+res_T2Low_ICS_df$threshold[res_T2Low_ICS_df$padj < 0.1 & res_T2Low_ICS_df$log2FoldChange < -1] <- "Downregulated"
+
+# Select top upregulated and downregulated genes
+top_up_ICS_T2Low <- res_T2Low_ICS_df[res_T2Low_ICS_df$padj < 0.1 & res_T2Low_ICS_df$log2FoldChange > 1, ]
+top_up_ICS_T2Low <- top_up_ICS_T2Low[order(top_up_ICS_T2Low$padj), ][1:min(15, nrow(top_up_ICS_T2Low)), ]
+
+top_down_ICS_T2Low <- res_T2Low_ICS_df[res_T2Low_ICS_df$padj < 0.1 & res_T2Low_ICS_df$log2FoldChange < -1, ]
+top_down_ICS_T2Low <- top_down_ICS_T2Low[order(top_down_ICS_T2Low$padj), ][1:min(15, nrow(top_down_ICS_T2Low)), ]
+
+top_genes_ICS_T2Low <- rbind(top_up_ICS_T2Low, top_down_ICS_T2Low)
+
+# Volcano plot with custom styling
+ggplot(res_T2Low_ICS_df, aes(x = log2FoldChange, y = neglog10_pvalue, color = threshold)) +
+  geom_point(alpha = 0.6) +
+  geom_text(data = top_genes_ICS_T2Low, aes(label = rownames(top_genes_ICS_T2Low)), size = 2.5) +  # Reduced label size
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", color = "black") +
+  labs(title = "Volcano Plot: T2 Low Samples (ICS Use vs No ICS Use)",
+       x = "Log2 Fold Change",
+       y = "-Log10(P-value)") +
+  theme_minimal()
+
+
+up_genes_low_ICS <- res_T2Low_ICS_df %>%
+  tibble::rownames_to_column("Gene") %>%   # move rownames into a column
+  filter(threshold == "Upregulated") %>%
+  pull(Gene)
+
+# 2. Save all downregulated gene names (use rownames)
+down_genes_low_ICS <- res_T2Low_ICS_df %>%
+  tibble::rownames_to_column("Gene") %>% 
+  filter(threshold == "Downregulated") %>%
+  pull(Gene)
+```
+```{r}
+max_len <- max(
+  length(up_genes), length(down_genes),
+  length(up_genes_high_ICS), length(down_genes_high_ICS),
+  length(up_genes_low_ICS),  length(down_genes_low_ICS),
+  length(up_genes_overall_ICS), length(down_genes_overall_ICS)
+)
+
+df_genes <- data.frame(
+  Up_T2High_vs_T2Low   = c(up_genes, rep(NA, max_len - length(up_genes))),
+  Down_T2High_vs_T2Low = c(down_genes, rep(NA, max_len - length(down_genes))),
+  Up_High_ICS          = c(up_genes_high_ICS, rep(NA, max_len - length(up_genes_high_ICS))),
+  Down_High_ICS        = c(down_genes_high_ICS, rep(NA, max_len - length(down_genes_high_ICS))),
+  Up_Low_ICS           = c(up_genes_low_ICS, rep(NA, max_len - length(up_genes_low_ICS))),
+  Down_Low_ICS         = c(down_genes_low_ICS, rep(NA, max_len - length(down_genes_low_ICS))),
+  Up_Overall_ICS       = c(up_genes_overall_ICS, rep(NA, max_len - length(up_genes_overall_ICS))),
+  Down_Overall_ICS     = c(down_genes_overall_ICS, rep(NA, max_len - length(down_genes_overall_ICS)))
+)
+
+write.csv(df_genes, "all_up_down_genes_wide.csv", row.names = FALSE)
+```
+

@@ -1,0 +1,2252 @@
+---
+title: "WGCNA_Final"
+author: "Gouri Anil"
+date: "2025-04-30"
+output: html_document
+---
+
+Install and load the necessary libraries
+```{r}
+library(dplyr)
+library(magrittr)
+library(WGCNA)
+library(tidyverse)
+library(DESeq2)
+library(gridExtra)
+library(psych)
+library(CorLevelPlot)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(DESeq2)
+library(ggplot2)
+
+allowWGCNAThreads()
+```
+Step 1: Load the counts data and the associated metadata
+```{r}
+# Counts data
+data <- read.csv("all_counts.csv", stringsAsFactors = FALSE) %>%
+  na.omit() %>%
+  group_by(Gene = .[[1]]) %>%
+  summarise(across(-1, ~ round(sum(.)))) %>%
+  as.data.frame() %>%
+  {rownames(.) <- .$Gene; .[, -1]}
+
+# Metadata
+phenoData <- read.csv("metadata.csv", row.names = 1)
+head(phenoData)
+
+
+```
+
+Step 2: Remove the low quality genes and samples 
+```{r}
+gsg <- goodSamplesGenes(t(data))
+summary(gsg)
+gsg$allOK
+table(gsg$goodGenes)
+table(gsg$goodSamples)
+
+# remove genes that are detected as outliers
+data <- data[gsg$goodGenes == TRUE, ]
+
+# detect outlier samples
+htree <- hclust(dist(t(data)), method = "average")
+plot(htree)
+
+
+pca <- prcomp(t(data))
+pca.dat <- pca$x
+pca.var <- pca$sdev^2
+pca.dat <- as.data.frame(pca.dat)
+pca.var.percent <- round(pca.var/sum(pca.var)*100, digits = 2)
+ggplot(pca.dat, aes(PC1,PC2)) + 
+  geom_point() + 
+  geom_text(label = rownames(pca.dat)) +
+  labs(x = paste0('PC1: ', pca.var.percent[1], '%'),
+       y = paste0('PC2: ', pca.var.percent[2], '%'))
+                                                                
+# exclude outlier samples
+samples.to.be.excluded <- c('')
+data.subset <- data[,!(colnames(data) %in% samples.to.be.excluded)]
+
+# create a new metadata with the excluded samples. Here, we do not remove any samples hence the subset is technically the same as the original metadata
+phenoData.subset <- phenoData[!(rownames(phenoData) %in% samples.to.be.excluded), ]
+```
+
+Step 3: Preprocessing
+Followings steps are performed:
+1. Log transformation (base 2)
+2. Remove genes with low counts
+3. Normalization
+```{r}
+# first, let us log transform the counts
+log_data <- log2(data.subset + 1)
+
+
+# making the rownames and column names identical
+all(rownames(phenoData.subset) %in% colnames(data.subset))
+all(rownames(phenoData.subset) == colnames(data.subset))
+
+# create dds
+dds <- DESeqDataSetFromMatrix( countData = data.subset,
+                               colData = phenoData.subset,
+                               design = ~ 1)
+# remove all genes with counts <= 15 in more than 75% of samples (77*0.75 = 57.75)
+dds75 <- dds[rowSums(counts(dds) >= 15) >= 58, ]
+nrow(dds75)
+
+# perform variance stabalization
+dds_norm <- vst(dds75)
+
+# get normalized counts
+norm.counts <- assay(dds_norm) %>%
+  t()
+```
+
+Step 4: Network Construction
+```{r}
+# choose a set of soft-thresholding powers
+power <- c(1:10, 11, seq(from = 12, to = 50, by = 2))
+
+
+# call the network topology analysis function
+sft <- pickSoftThreshold(norm.counts,
+                  powerVector = power,
+                  networkType = "signed",
+                  verbose = 5)
+sft.data <- sft$fitIndices
+
+sft.data <- sft.data %>% filter(Power >= 1 & Power <= 20)
+sft.data %>% filter(Power == 11)
+
+
+# visualization to pick power
+a1 <- ggplot(sft.data, aes(Power,SFT.R.sq, label = Power)) + 
+  geom_point() + 
+  geom_text(nudge_y = 0.1) +
+  geom_hline(yintercept = 0.8, color = "red") +
+  labs(x = 'Power', y = 'Scale free topology model fit, signed R^2') +
+  theme_classic()
+
+a2 <- ggplot(sft.data, aes(Power, mean.k., label = Power)) +
+  geom_point() +
+  geom_text(vjust = -1) +
+  labs(x = 'Power', y = "Mean Connectivity") +
+  theme_classic()
+
+grid.arrange(a1, a2, nrow = 2)
+
+
+
+# convert matrix to numeric
+norm.counts[] <- sapply(norm.counts, as.numeric)
+soft_power <- 18
+cor <- WGCNA::cor
+temp_cor <- cor
+
+# memory estimate w.r.t blocksize
+bwnet <- blockwiseModules(norm.counts,
+                 maxBlockSize = 14000,
+                 TOMType = "signed",
+                 power = soft_power,
+                 minModuleSize = 30,
+                 mergeCutHeight = 0.25,
+                 numericLabels = FALSE,
+                 randomSeed = 1234,
+                 verbose = 3)
+
+cor <- temp_cor
+
+# Module Eigengenes
+module_eigengenes <- bwnet$MEs
+head(module_eigengenes)
+
+# get number of genes from each module
+table <- table(bwnet$colors) %>% 
+  as.data.frame()
+print(table)
+# Plot the dendrogeam and the module colors before and after merging underneath
+plotDendroAndColors(bwnet$dendrograms[[1]], cbind(bwnet$unmergedColors, bwnet$colors),
+                    c("unmerged","merged"),
+                    dendroLabels = FALSE,
+                    addGuide = TRUE,
+                    hang = 0.03,
+                    guideHang = 0.05)
+```
+
+Step 5: Create traits to associate with the networks
+```{r}
+# create traits file - binarize categorical variables
+traits_asthma <- phenoData.subset %>% 
+  mutate(Asthma = ifelse(grepl('Asthma', status), 1, 0)) %>%
+  select(Asthma)
+
+# binarize categorical variables
+traits_t2 <- phenoData.subset %>% 
+  mutate(T2_High = ifelse(grepl('High', T2_Status), 1, 0)) %>%
+  select(T2_High)
+
+# repeat the process for ICS use
+traits_acs <- phenoData.subset %>% 
+  mutate(ICS_Use = ifelse(grepl('ACS', patient_type), 1, 0)) %>%
+  select(ICS_Use)
+
+traits_healthy <- phenoData.subset %>% 
+  mutate(Healthy = ifelse(grepl('Healthy', status), 1, 0)) %>%
+  select(Healthy)
+
+traits_t2_low <- phenoData.subset %>% 
+  mutate(T2_Low = ifelse(grepl('Low', T2_Status), 1, 0)) %>%
+  select(T2_Low)
+
+traits_no_ics <- phenoData.subset %>% 
+  mutate(No_ICS = ifelse(grepl('ATH', patient_type), 1, 0)) %>%
+  select(No_ICS)
+
+# combiine the traitsÍ
+traits <- cbind(traits_asthma, traits_t2, traits_acs, traits_t2_low, traits_no_ics)
+
+```
+
+Step 6: Module-trait association
+```{r}
+# Define number of genes and samples
+nSamples <- nrow(norm.counts)
+nGenes <- ncol(norm.counts)
+
+module.trait.corr <- cor(module_eigengenes, traits, use = "p")
+module.trait.corr.pvals <- corPvalueStudent(module.trait.corr, nSamples)
+
+# visualize module-trait association as a heatmap
+heatmap.data <- merge(module_eigengenes, traits, by = "row.names") 
+rownames(heatmap.data) <- heatmap.data$Row.names
+heatmap.data$Row.names <- NULL
+head(heatmap.data)
+
+CorLevelPlot(heatmap.data,
+             x = names(heatmap.data)[1:8],
+             y = names(heatmap.data)[9:13],
+             col = c("blue3", "white","red"))
+
+module_gene_mapping <- as.data.frame(bwnet$colors)
+
+# Calculate the module membership and the associated p-values
+module.membership.measure <- cor(module_eigengenes, norm.counts, use ='p')
+module.membership.measure.pvals <- corPvalueStudent(module.membership.measure, nSamples)
+
+module.membership.measure.pvals[1:7,1:5]
+
+
+
+```
+
+```{r}
+library(reshape2)
+library(ggplot2)
+
+# Step 1: calculate correlations for the selected traits
+traits.keep <- c("Asthma", "T2_High", "T2_Low")
+
+# module-trait correlation subset
+module.trait.sub <- module.trait.corr[, traits.keep, drop = FALSE]
+
+# Step 2: clean up column names for prettier plotting
+colnames(module.trait.sub) <- c("Asthma", "T2 High", "T2 Low")
+
+# Step 3: melt into long format
+df.long <- melt(module.trait.sub, varnames = c("Module", "Trait"), value.name = "Correlation")
+
+# Step 4: make the heatmap
+p <- ggplot(df.long, aes(x = Trait, y = Module, fill = Correlation)) +
+  geom_tile(color = "black", linewidth = 0.6) +
+  scale_fill_gradient2(
+    low = "#113F67", mid = "white", high = "#DC143C",
+    midpoint = 0,
+    limits = c(-0.4, 0.4),  # set legend range
+    oob = scales::squish
+  ) +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Module–Trait Associations and T2 Subtypes",
+    x = "", y = "", fill = "Correlation"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.margin = margin(10, 80, 10, 10),        # widen plot
+    legend.key.height = unit(0.4, "cm"),         # shrink legend vertical size
+    legend.key.width  = unit(0.4, "cm"),         # shrink legend horizontal size
+    legend.text = element_text(size = 9),        # smaller legend labels
+    legend.title = element_text(size = 12),      # smaller legend title
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5) # bold centered title
+  )
+
+p
+
+```
+
+Step 7: Asthma vs Healthy Analysis
+```{r}
+# Load libraries
+library(WGCNA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+
+# Create output directory
+dir.create("Asthma_hub_GO", showWarnings = FALSE)
+
+# Compute gene significance and p-values
+gene.significance.corr <- cor(norm.counts, traits$Asthma, use = 'p')
+gene.significance.corr.pvals <- corPvalueStudent(gene.significance.corr, nSamples)
+
+# ---------------------------- YELLOW MODULE ----------------------------
+
+yellow_genes <- module_gene_mapping %>%
+  filter(bwnet$colors == 'yellow') %>%
+  rownames()
+
+yellow_MM <- module.membership.measure['MEyellow', yellow_genes]
+yellow_GS <- gene.significance.corr[yellow_genes, 1]
+
+highlight_genes <- abs(yellow_MM) > 0.8 & abs(yellow_GS) > 0.2
+point_colors <- ifelse(highlight_genes, "red", "yellow4")
+
+pdf("Asthma_hub_GO/yellow_MM_vs_GS.pdf")
+verboseScatterplot(
+  x = abs(yellow_MM),
+  y = abs(yellow_GS),
+  xlab = "Module Membership in Yellow Module",
+  ylab = "Gene Significance for Asthma",
+  main = "MM vs. GS: Yellow Module (Red = MM > 0.8 & GS > 0.2)",
+  col = point_colors,
+  cex = 1.5,
+  cex.lab = 1.3,
+  cex.axis = 1.2,
+  cex.main = 1
+)
+dev.off()
+
+# Get hub genes
+hub_genes_mask <- abs(yellow_MM) > 0.8 & abs(yellow_GS) > 0.2
+hub_genes <- yellow_genes[hub_genes_mask]
+
+hub_gene_df <- data.frame(
+  Gene = hub_genes,
+  kME_MEyellow = yellow_MM[hub_genes],
+  GS_Asthma = yellow_GS[hub_genes]
+)
+write.csv(hub_gene_df, "Asthma_hub_GO/hub_genes_yellow_module_merged.csv", row.names = FALSE)
+
+# GO enrichment
+gene_df <- bitr(hub_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+ego <- enrichGO(gene = gene_df$ENTREZID,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.2,
+                readable = TRUE)
+
+# Save table
+ego_df <- as.data.frame(ego)
+write.csv(ego_df[1:20, c("ID", "Description", "Count", "p.adjust", "geneID")],
+          "Asthma_hub_GO/GO_Asthma_MEyellow.csv", row.names = FALSE)
+
+# ---- GO BARPLOT (matches your uploaded image) ----
+
+ego_df$ONTOLOGY <- factor(ego_df$ONTOLOGY, levels = c("BP", "CC", "MF"))
+top_terms <- ego_df %>%
+  group_by(ONTOLOGY) %>%
+  slice_min(order_by = p.adjust, n = 8) %>%
+  ungroup()
+
+library(stringr)
+top_terms$Description <- str_wrap(top_terms$Description, width = 60)
+
+p <- ggplot(top_terms, aes(x = Count, y = reorder(Description, Count), fill = p.adjust)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(ONTOLOGY), scales = "free_y", space = "free_y") +
+  scale_fill_gradientn(
+    colors = c("red", "blue"),
+    values = c(0, 0.5, 1),
+    name = "p.adjust"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_line(color = "grey80", size = 0.3),
+    panel.grid.major.x = element_line(color = "grey90", size = 0.2),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.6),
+    strip.background = element_rect(fill = "grey95", color = "black", size = 0.5),
+    strip.text.y = element_text(angle = 0, size = 14, face = "bold"),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    panel.spacing = unit(1, "lines")
+  ) +
+  labs(x = "Count", y = NULL, title = "GO Enrichment by Ontology for Yellow Module")
+  
+
+ggsave("Asthma_hub_GO/yellow_GO_barplot.pdf", plot = p, width = 12, height = 15)
+
+# ---------------------------- BLUE MODULE ----------------------------
+
+blue_genes <- module_gene_mapping %>%
+  filter(bwnet$colors == 'blue') %>%
+  rownames()
+
+blue_MM <- module.membership.measure['MEblue', blue_genes]
+blue_GS <- gene.significance.corr[blue_genes, 1]
+
+highlight_genes <- abs(blue_MM) > 0.8 & abs(blue_GS) > 0.2
+point_colors <- ifelse(highlight_genes, "red", "blue")
+
+pdf("Asthma_hub_GO/blue_MM_vs_GS.pdf")
+verboseScatterplot(
+  x = abs(blue_MM),
+  y = abs(blue_GS),
+  xlab = "Module Membership in Blue Module",
+  ylab = "Gene Significance for Asthma",
+  main = "MM vs. GS: Blue Module (Red = MM > 0.8 & GS > 0.2)",
+  col = point_colors,
+  cex = 1.5,
+  cex.lab = 1.3,
+  cex.axis = 1.2,
+  cex.main = 1
+)
+dev.off()
+
+hub_genes_mask <- abs(blue_MM) > 0.8 & abs(blue_GS) > 0.2
+hub_genes <- blue_genes[hub_genes_mask]
+
+hub_gene_df <- data.frame(
+  Gene = hub_genes,
+  kME_MEblue = blue_MM[hub_genes],
+  GS_Asthma = blue_GS[hub_genes]
+)
+write.csv(hub_gene_df, "Asthma_hub_GO/hub_genes_blue_module_merged.csv", row.names = FALSE)
+
+gene_df <- bitr(hub_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+ego <- enrichGO(gene = gene_df$ENTREZID,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.2,
+                readable = TRUE)
+
+# Save table
+ego_df <- as.data.frame(ego)
+write.csv(ego_df[1:20, c("ID", "Description", "Count", "p.adjust", "geneID")],
+          "Asthma_hub_GO/GO_Asthma_MEblue.csv", row.names = FALSE)
+
+# ---- GO BARPLOT (image-style) ----
+
+ego_df$ONTOLOGY <- factor(ego_df$ONTOLOGY, levels = c("BP", "CC", "MF"))
+top_terms <- ego_df %>%
+  group_by(ONTOLOGY) %>%
+  slice_min(order_by = p.adjust, n = 8) %>%
+  ungroup()
+
+p <- ggplot(top_terms, aes(x = Count, y = reorder(Description, Count), fill = p.adjust)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(ONTOLOGY), scales = "free_y", space = "free_y") +
+  scale_fill_gradientn(
+    colors = c("red", "magenta", "blue"),
+    values = c(0, 0.5, 1),
+    name = "p.adjust"
+  ) +
+  theme_minimal(base_size = 12) +
+theme(
+  panel.grid.major.y = element_line(color = "grey80", size = 0.3),  # horizontal grid lines
+  panel.grid.major.x = element_line(color = "grey90", size = 0.2),  # vertical grid lines
+  panel.border = element_rect(color = "black", fill = NA, size = 0.6),  # full border
+  strip.background = element_rect(fill = "grey95", color = "black", size = 0.5),  # box around facet labels
+  strip.text.y = element_text(angle = 0, size = 14, face = "bold"),
+  axis.text.y = element_text(size = 9),
+  axis.text.x = element_text(size = 10),
+  axis.title = element_text(size = 12),
+  panel.spacing = unit(1, "lines")
+) +
+  labs(
+    x = "Count",
+    y = NULL,
+    title = "GO Enrichment by Ontology - Blue Module"
+  )
+
+ggsave("Asthma_hub_GO/blue_GO_barplot.pdf", plot = p, width = 15, height = 10)
+
+```
+
+Step 8: T2 High Analysis
+```{r}
+# ---------------------- YELLOW MODULE vs T2_high ----------------------
+
+# Load required libraries
+library(WGCNA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+# Create output directory
+dir.create("T2_high_hub_GO", showWarnings = FALSE)
+
+# ---------------------------- Yellow Module: T2 High ----------------------------
+
+# Subset yellow module genes
+yellow_genes <- module_gene_mapping %>%
+  filter(bwnet$colors == 'yellow') %>%
+  rownames()
+
+# Gene significance for T2 High trait
+gene.significance.corr.T2 <- cor(norm.counts, traits$T2_high, use = 'p')
+gene.significance.corr.T2.pvals <- corPvalueStudent(gene.significance.corr.T2, nSamples)
+
+yellow_MM <- module.membership.measure['MEyellow', yellow_genes]
+yellow_GS_T2 <- gene.significance.corr.T2[yellow_genes, 1]
+
+# Highlight hub gene candidates
+highlight_genes <- abs(yellow_MM) > 0.8 & abs(yellow_GS_T2) > 0.2
+point_colors <- ifelse(highlight_genes, "red", "yellow3")
+
+# MM vs GS Scatterplot
+pdf("T2_high_hub_GO/yellow_T2_high_MM_vs_GS.pdf")
+verboseScatterplot(
+  x = abs(yellow_MM),
+  y = abs(yellow_GS_T2),
+  xlab = "Module Membership in Yellow Module",
+  ylab = "Gene Significance for T2 High",
+  main = "MM vs. GS: Yellow Module vs T2 High (Red = MM > 0.8 & GS > 0.2)",
+  col = point_colors,
+  cex = 1.5,
+  cex.lab = 1.3,
+  cex.axis = 1.2,
+  cex.main = 0.6
+)
+dev.off()
+
+# Identify hub genes
+hub_genes_mask <- abs(yellow_MM) > 0.8 & abs(yellow_GS_T2) > 0.2
+hub_genes <- yellow_genes[hub_genes_mask]
+
+hub_gene_df <- data.frame(
+  Gene = hub_genes,
+  kME_MEyellow = yellow_MM[hub_genes],
+  GS_T2_high = yellow_GS_T2[hub_genes]
+)
+write.csv(hub_gene_df, "T2_high_hub_GO/hub_genes_yellow_T2_high.csv", row.names = FALSE)
+
+# ---------------------------- GO Enrichment ----------------------------
+
+# Perform GO enrichment
+gene_df <- bitr(hub_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+ego <- enrichGO(
+  gene = gene_df$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+# Save results
+ego_df <- as.data.frame(ego)
+write.csv(ego_df[1:20, c("ID", "Description", "Count", "p.adjust", "geneID")],
+          "T2_high_hub_GO/GO_T2_high_MEyellow.csv", row.names = FALSE)
+
+# ---------------------------- GO Barplot (Faceted, Color-coded, Wrapped) ----------------------------
+
+# Format for plotting
+ego_df$ONTOLOGY <- factor(ego_df$ONTOLOGY, levels = c("BP", "CC", "MF"))
+
+# Keep top 8 terms per ontology
+top_terms <- ego_df %>%
+  group_by(ONTOLOGY) %>%
+  slice_min(order_by = p.adjust, n = 8) %>%
+  ungroup()
+
+# Wrap long GO term names
+top_terms$Description <- str_wrap(top_terms$Description, width = 40)
+
+# Plot
+p <- ggplot(top_terms, aes(x = Count, y = reorder(Description, Count), fill = p.adjust)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(ONTOLOGY), scales = "free_y", space = "free_y") +
+  scale_fill_gradientn(
+    colors = c("red", "magenta", "blue"),
+    values = c(0, 0.5, 1),
+    name = "p.adjust"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_line(color = "grey80", size = 0.3),
+    panel.grid.major.x = element_line(color = "grey90", size = 0.2),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.6),
+    strip.background = element_rect(fill = "grey95", color = "black", size = 0.5),
+    strip.text.y = element_text(angle = 0, size = 14, face = "bold"),
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    panel.spacing = unit(1, "lines")
+  ) +
+  labs(
+    x = "Count",
+    y = NULL,
+    title = "GO Enrichment by Ontology - Yellow Module (T2 High)"
+  )
+
+# Save plot
+ggsave("T2_high_hub_GO/yellow_T2_high_GO_barplot.pdf", plot = p, width = 10, height = 5)
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+
+# ----------------------------- #
+# Load DAVID-style GO CSV file
+# ----------------------------- #
+load_go_david <- function(file_path) {
+  df <- read.csv(file_path) %>%
+    filter(!is.na(Term)) %>%
+    arrange(FDR) %>%
+    head(8) %>%
+    mutate(
+      ONTOLOGY = case_when(
+        grepl("BP", Category) ~ "BP",
+        grepl("CC", Category) ~ "CC",
+        grepl("MF", Category) ~ "MF",
+        TRUE ~ "Other"
+      ),
+      # Remove GO ID from term
+      Description = str_wrap(gsub("\\s*\\(GO:\\d+\\)", "", Term), width = 45)
+    )
+  return(df)
+}
+
+# ----------------------------- #
+# Load and Combine All Ontologies
+# ----------------------------- #
+bp_terms <- load_go_david("T2_high_hub_GO/BP.csv")
+cc_terms <- load_go_david("T2_high_hub_GO/CC.csv")
+mf_terms <- load_go_david("T2_high_hub_GO/MF.csv")
+
+combined_terms <- bind_rows(bp_terms, cc_terms, mf_terms)
+
+# Ensure consistent facet order
+combined_terms$ONTOLOGY <- factor(combined_terms$ONTOLOGY, levels = c("BP", "CC", "MF"))
+
+# ----------------------------- #
+# Faceted GO Barplot
+# ----------------------------- #
+p <- ggplot(combined_terms, aes(x = Count, y = reorder(Description, Count), fill = FDR)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(ONTOLOGY), scales = "free_y", space = "free_y") +
+  scale_fill_gradientn(
+    colors = c("red", "magenta", "blue"),
+    values = rescale(c(min(combined_terms$FDR), max(combined_terms$FDR))),
+    name = "FDR"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = "grey95", color = "black", size = 0.6),
+    strip.text.y = element_text(angle = 0, size = 14, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.6),
+    panel.grid.major.y = element_line(color = "grey80", size = 0.3),
+    panel.grid.major.x = element_line(color = "grey90", size = 0.2),
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    panel.spacing = unit(1, "lines")
+  ) +
+  labs(
+    x = "Gene Count",
+    y = NULL,
+    title = "GO Enrichment by Ontology (Yellow Module – T2 High)"
+  )
+
+# Save output
+ggsave("T2_high_hub_GO/yellow_T2_high_combined_GO_DAVID.pdf", plot = p, width = 10, height = 6)
+
+
+```
+
+
+Step 9: T2 Low analysis
+```{r}
+# ---------------------- TURQUOISE MODULE vs T2_Low ----------------------
+
+# Load necessary libraries
+library(WGCNA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+# ---------------------- TURQUOISE MODULE vs T2_Low ----------------------
+
+# Create output directory
+dir.create("T2Low_hub_GO", showWarnings = FALSE)
+
+# Subset turquoise genes
+turquoise_genes <- module_gene_mapping %>%
+  filter(bwnet$colors == 'turquoise') %>%
+  rownames()
+
+# Gene significance for T2_Low
+gene.significance.corr.T2Low <- cor(norm.counts, traits$T2_Low, use = 'p')
+gene.significance.corr.T2Low.pvals <- corPvalueStudent(gene.significance.corr.T2Low, nSamples)
+
+# Module membership and gene significance
+turquoise_MM <- module.membership.measure['MEturquoise', turquoise_genes]
+turquoise_GS_T2Low <- gene.significance.corr.T2Low[turquoise_genes, 1]
+
+# Highlight hub gene candidates
+highlight_genes <- abs(turquoise_MM) > 0.8 & abs(turquoise_GS_T2Low) > 0.2
+point_colors <- ifelse(highlight_genes, "red", "turquoise")
+
+# Save MM vs GS plot
+pdf("T2Low_hub_GO/turquoise_T2_Low_MM_vs_GS.pdf")
+verboseScatterplot(
+  x = abs(turquoise_MM),
+  y = abs(turquoise_GS_T2Low),
+  xlab = "Module Membership in Turquoise Module",
+  ylab = "Gene Significance for T2 Low",
+  main = "MM vs. GS: Turquoise Module vs T2_Low (Red = MM > 0.8 & GS > 0.2)",
+  col = point_colors,
+  cex = 1.5,
+  cex.lab = 1.3,
+  cex.axis = 1.2,
+  cex.main = 0.8
+)
+dev.off()
+
+# Identify hub genes
+hub_genes_mask <- abs(turquoise_MM) > 0.8 & abs(turquoise_GS_T2Low) > 0.2
+hub_genes <- turquoise_genes[hub_genes_mask]
+
+# Save hub gene data
+hub_gene_df <- data.frame(
+  Gene = hub_genes,
+  kME_MEturquoise = turquoise_MM[hub_genes],
+  GS_T2_Low = turquoise_GS_T2Low[hub_genes]
+)
+write.csv(hub_gene_df, "T2Low_hub_GO/hub_genes_turquoise_T2_Low.csv", row.names = FALSE)
+
+# ---------------------- GO Enrichment ----------------------
+
+# Perform enrichment
+gene_df <- bitr(hub_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+ego <- enrichGO(
+  gene = gene_df$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+# Save full GO table
+ego_df <- as.data.frame(ego)
+write.csv(ego_df[1:20, c("ID", "Description", "Count", "p.adjust", "geneID")],
+          "T2Low_hub_GO/GO_T2_Low_MEturquoise.csv", row.names = FALSE)
+
+# ---------------------- Faceted GO Barplot ----------------------
+
+# Prepare GO categories for plotting
+ego_df$ONTOLOGY <- factor(ego_df$ONTOLOGY, levels = c("BP", "CC", "MF"))
+
+# Top 8 terms per ontology for better visuals
+top_terms <- ego_df %>%
+  group_by(ONTOLOGY) %>%
+  slice_min(order_by = p.adjust, n = 8) %>%
+  ungroup()
+
+# Wrap long GO term descriptions to fit better
+top_terms$Description <- str_wrap(top_terms$Description, width = 40)
+
+# Create the plot
+p <- ggplot(top_terms, aes(x = Count, y = reorder(Description, Count), fill = p.adjust)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(ONTOLOGY), scales = "free_y", space = "free_y") +
+  scale_fill_gradientn(
+    colors = c("red", "magenta", "blue"),
+    values = c(0, 0.5, 1),
+    name = "p.adjust"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_line(color = "grey80", size = 0.3),
+    panel.grid.major.x = element_line(color = "grey90", size = 0.2),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.6),
+    strip.background = element_rect(fill = "grey95", color = "black", size = 0.5),
+    strip.text.y = element_text(angle = 0, size = 14, face = "bold"),
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    panel.spacing = unit(1, "lines")
+  ) +
+  labs(
+    x = "Count",
+    y = NULL,
+    title = "GO Enrichment by Ontology - Turquoise Module (T2 Low)"
+  )
+
+# Save as PDF
+ggsave("T2Low_hub_GO/turquoise_T2_Low_GO_barplot.pdf", plot = p, width = 10, height = 10)
+
+
+```
+
+```{r}
+# -----------------------------#
+# Load Required Libraries
+# -----------------------------#
+library(WGCNA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+# -----------------------------#
+# Create Output Directory
+# -----------------------------#
+dir.create("ICS_use_hub_GO", showWarnings = FALSE)
+
+# -----------------------------#
+# Subset Yellow Module Genes
+# -----------------------------#
+yellow_genes <- module_gene_mapping %>%
+  filter(bwnet$colors == 'yellow') %>%
+  rownames()
+
+# -----------------------------#
+# Filter samples with non-NA ICS_Use
+# -----------------------------#
+valid_samples <- rownames(traits)[!is.na(traits$ICS_Use) & rownames(traits) %in% rownames(norm.counts)]
+
+# Subset expression matrix and ICS_Use vector
+norm.counts.subset <- norm.counts[valid_samples, ]
+ICS_use_vector <- as.matrix(traits[valid_samples, "ICS_Use", drop = FALSE])
+rownames(ICS_use_vector) <- rownames(norm.counts.subset)
+
+# -----------------------------#
+# Gene Significance and Module Membership
+# -----------------------------#
+gene.significance.corr.ICS <- cor(norm.counts.subset, ICS_use_vector, use = "pairwise.complete.obs")
+gene.significance.corr.ICS.pvals <- corPvalueStudent(gene.significance.corr.ICS, nSamples)
+
+yellow_MM <- module.membership.measure["MEyellow", yellow_genes]
+yellow_GS_ICS <- gene.significance.corr.ICS[yellow_genes, 1]
+
+# -----------------------------#
+# Highlight Hub Genes (MM > 0.8 & GS > 0.2)
+# -----------------------------#
+highlight_genes <- abs(yellow_MM) > 0.8 & abs(yellow_GS_ICS) > 0.2
+point_colors <- ifelse(highlight_genes, "red", "yellow3")
+
+# -----------------------------#
+# MM vs GS Plot
+# -----------------------------#
+pdf("ICS_use_hub_GO/yellow_ICS_use_MM_vs_GS.pdf")
+verboseScatterplot(
+  x = abs(yellow_MM),
+  y = abs(yellow_GS_ICS),
+  xlab = "Module Membership in Yellow Module",
+  ylab = "Gene Significance for ICS Use",
+  main = "MM vs. GS: Yellow Module vs ICS Use (Red = MM > 0.8 & GS > 0.2)",
+  col = point_colors,
+  cex = 1.5,
+  cex.lab = 1.3,
+  cex.axis = 1.2,
+  cex.main = 0.8
+)
+dev.off()
+
+# -----------------------------#
+# Save Hub Genes to CSV
+# -----------------------------#
+hub_genes <- yellow_genes[highlight_genes]
+hub_gene_df <- data.frame(
+  Gene = hub_genes,
+  kME_MEyellow = yellow_MM[hub_genes],
+  GS_ICS_Use = yellow_GS_ICS[hub_genes]
+)
+write.csv(hub_gene_df, "ICS_use_hub_GO/hub_genes_yellow_ICS_use.csv", row.names = FALSE)
+
+# -----------------------------#
+# GO Enrichment
+# -----------------------------#
+if (length(hub_genes) > 0) {
+  gene_df <- bitr(hub_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+  ego <- enrichGO(
+    gene = gene_df$ENTREZID,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = "ALL",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2,
+    readable = TRUE
+  )
+
+  ego_df <- as.data.frame(ego)
+  write.csv(ego_df[1:20, c("ID", "Description", "Count", "p.adjust", "geneID")],
+            "ICS_use_hub_GO/GO_ICS_MEyellow.csv", row.names = FALSE)
+
+  # Top 8 terms per ontology
+  top_terms <- ego_df %>%
+    mutate(ONTOLOGY = factor(ONTOLOGY, levels = c("BP", "CC", "MF"))) %>%
+    group_by(ONTOLOGY) %>%
+    slice_min(order_by = p.adjust, n = 8) %>%
+    ungroup() %>%
+    mutate(Description = str_wrap(Description, width = 40))
+
+  # Barplot
+  p <- ggplot(top_terms, aes(x = Count, y = reorder(Description, Count), fill = p.adjust)) +
+    geom_bar(stat = "identity") +
+    facet_grid(rows = vars(ONTOLOGY), scales = "free_y", space = "free_y") +
+    scale_fill_gradientn(colors = c("red", "magenta", "blue"), values = c(0, 0.5, 1), name = "p.adjust") +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.major.y = element_line(color = "grey80", size = 0.3),
+      panel.grid.major.x = element_line(color = "grey90", size = 0.2),
+      panel.border = element_rect(color = "black", fill = NA, size = 0.6),
+      strip.background = element_rect(fill = "grey95", color = "black", size = 0.5),
+      strip.text.y = element_text(angle = 0, size = 14, face = "bold"),
+      axis.text.y = element_text(size = 7),
+      axis.text.x = element_text(size = 10),
+      axis.title = element_text(size = 12),
+      panel.spacing = unit(1, "lines")
+    ) +
+    labs(x = "Count", y = NULL, title = "GO Enrichment by Ontology - Yellow Module (ICS Use)")
+
+  ggsave("ICS_use_hub_GO/yellow_ICS_GO_barplot.pdf", plot = p, width = 14, height = 10)
+}
+
+```
+
+
+Analysis to check interaction between T2 Status and ICS Use
+```{r}
+phenoData$Patient_Type <- factor(phenoData$Patient_Type)
+phenoData$T2_Status <- factor(phenoData$T2_Status)
+```
+
+```{r}
+interaction_results <- lapply(colnames(module_eigengenes), function(module) {
+  fit <- lm(module_eigengenes[, module] ~ Patient_Type * T2_Status, data = phenoData)
+  summary(fit)$coefficients
+})
+names(interaction_results) <- colnames(module_eigengenes)
+
+```
+
+```{r}
+summary_table <- do.call(rbind, lapply(names(interaction_results), function(mod) {
+  coef_table <- interaction_results[[mod]]
+  data.frame(
+    Module = mod,
+    Intercept_Estimate = coef_table["(Intercept)", "Estimate"],
+    Intercept_P = coef_table["(Intercept)", "Pr(>|t|)"],
+    Patient_Type_Estimate = coef_table["Patient_TypeATH", "Estimate"],
+    Patient_Type_P = coef_table["Patient_TypeATH", "Pr(>|t|)"],
+    T2_Status_Estimate = coef_table["T2_StatusLow", "Estimate"],
+    T2_Status_P = coef_table["T2_StatusLow", "Pr(>|t|)"],
+    Interaction_Estimate = coef_table["Patient_TypeATH:T2_StatusLow", "Estimate"],
+    Interaction_P = coef_table["Patient_TypeATH:T2_StatusLow", "Pr(>|t|)"]
+  )
+}))
+
+library(ggplot2)
+
+# create a dataframe with variables
+plot_data <- data.frame(
+  ME = module_eigengenes$MEblack,  # replace MEname with your module
+  Patient_Type = phenoData$Patient_Type,
+  T2_Status = phenoData$T2_Status
+)
+
+ggplot(plot_data, aes(x = T2_Status, y = ME, color = Patient_Type, group = Patient_Type)) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1) +
+  theme_minimal() +
+  labs(title = "Interaction plot: MEblack", y = "Module eigengene")
+
+# create a dataframe with variables
+plot_data <- data.frame(
+  ME = module_eigengenes$MEturquoise,  # replace MEname with your module
+  Patient_Type = phenoData$Patient_Type,
+  T2_Status = phenoData$T2_Status
+)
+
+ggplot(plot_data, aes(x = T2_Status, y = ME, color = Patient_Type, group = Patient_Type)) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1) +
+  theme_minimal() +
+  labs(title = "Interaction plot: MEturquoise", y = "Module eigengene")
+
+
+```
+
+Step 10: No ICS Use
+```{r}
+# ---------------------- BLACK MODULE vs No_ICS ----------------------
+
+# Load required libraries
+library(WGCNA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+# Create output directory
+dir.create("NoICS_hub_GO", showWarnings = FALSE)
+
+# Subset black module genes
+black_genes <- module_gene_mapping %>%
+  filter(bwnet$colors == 'black') %>%
+  rownames()
+
+# Gene significance for No ICS
+gene.significance.corr.NoICS <- cor(norm.counts, traits$No_ICS, use = 'p')
+gene.significance.corr.NoICS.pvals <- corPvalueStudent(gene.significance.corr.NoICS, nSamples)
+
+# Module membership and gene significance
+black_MM <- module.membership.measure['MEblack', black_genes]
+black_GS_NoICS <- gene.significance.corr.NoICS[black_genes, 1]
+
+# Highlight hub genes (MM > 0.8 and GS > 0.2)
+highlight_genes <- abs(black_MM) > 0.8 & abs(black_GS_NoICS) > 0.2
+point_colors <- ifelse(highlight_genes, "red", "black")
+
+# Save MM vs GS plot
+pdf("NoICS_hub_GO/black_No_ICS_MM_vs_GS.pdf")
+verboseScatterplot(
+  x = abs(black_MM),
+  y = abs(black_GS_NoICS),
+  xlab = "Module Membership in Black Module",
+  ylab = "Gene Significance for No ICS",
+  main = "MM vs. GS: Black Module vs No_ICS (Red = MM > 0.8 & GS > 0.2)",
+  col = point_colors,
+  cex = 1.5,
+  cex.lab = 1.3,
+  cex.axis = 1.2,
+  cex.main = 0.8
+)
+dev.off()
+
+# Identify hub genes
+hub_genes_mask <- abs(black_MM) > 0.8 & abs(black_GS_NoICS) > 0.2
+hub_genes <- black_genes[hub_genes_mask]
+
+# Save hub genes to CSV
+hub_gene_df <- data.frame(
+  Gene = hub_genes,
+  kME_MEblack = black_MM[hub_genes],
+  GS_No_ICS = black_GS_NoICS[hub_genes]
+)
+write.csv(hub_gene_df, "NoICS_hub_GO/hub_genes_black_No_ICS.csv", row.names = FALSE)
+
+# ---------------------- GO ENRICHMENT ----------------------
+
+if (length(hub_genes) > 0) {
+  gene_df <- bitr(hub_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  ego <- enrichGO(gene = gene_df$ENTREZID,
+                  OrgDb = org.Hs.eg.db,
+                  keyType = "ENTREZID",
+                  ont = "ALL",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff = 0.05,
+                  qvalueCutoff = 0.2,
+                  readable = TRUE)
+
+  # Save top 20 GO terms
+  ego_df <- as.data.frame(ego)
+  write.csv(ego_df[1:20, c("ID", "Description", "Count", "p.adjust", "geneID")],
+            "NoICS_hub_GO/GO_No_ICS_MEblack.csv", row.names = FALSE)
+
+  # Prepare barplot data
+  top_terms <- ego_df %>%
+    mutate(ONTOLOGY = factor(ONTOLOGY, levels = c("BP", "CC", "MF"))) %>%
+    group_by(ONTOLOGY) %>%
+    slice_min(order_by = p.adjust, n = 8) %>%
+    ungroup() %>%
+    mutate(Description = str_wrap(Description, width = 40))
+
+  # Create barplot
+  p <- ggplot(top_terms, aes(x = Count, y = reorder(Description, Count), fill = p.adjust)) +
+    geom_bar(stat = "identity") +
+    facet_grid(rows = vars(ONTOLOGY), scales = "free_y", space = "free_y") +
+    scale_fill_gradientn(
+      colors = c("red", "magenta", "blue"),
+      values = c(0, 0.5, 1),
+      name = "p.adjust"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.major.y = element_line(color = "grey80", size = 0.3),
+      panel.grid.major.x = element_line(color = "grey90", size = 0.2),
+      panel.border = element_rect(color = "black", fill = NA, size = 0.6),
+      strip.background = element_rect(fill = "grey95", color = "black", size = 0.5),
+      strip.text.y = element_text(angle = 0, size = 14, face = "bold"),
+      axis.text.y = element_text(size = 9),
+      axis.text.x = element_text(size = 10),
+      axis.title = element_text(size = 12),
+      panel.spacing = unit(1, "lines")
+    ) +
+    labs(
+      x = "Count",
+      y = NULL,
+      title = "GO Enrichment by Ontology - Black Module (No ICS)"
+    )
+
+  # Save plot
+  ggsave("NoICS_hub_GO/black_No_ICS_GO_barplot.pdf", plot = p, width = 10, height = 10)
+}
+
+```
+
+Analysis to check interaction between T2 Status and ICS Use
+```{r}
+phenoData$Patient_Type <- factor(phenoData$Patient_Type)
+phenoData$T2_Status <- factor(phenoData$T2_Status)
+```
+
+```{r}
+interaction_results <- lapply(colnames(module_eigengenes), function(module) {
+  fit <- lm(module_eigengenes[, module] ~ Patient_Type * T2_Status, data = phenoData)
+  summary(fit)$coefficients
+})
+names(interaction_results) <- colnames(module_eigengenes)
+
+```
+
+```{r}
+summary_table <- do.call(rbind, lapply(names(interaction_results), function(mod) {
+  coef_table <- interaction_results[[mod]]
+  data.frame(
+    Module = mod,
+    Intercept_Estimate = coef_table["(Intercept)", "Estimate"],
+    Intercept_P = coef_table["(Intercept)", "Pr(>|t|)"],
+    Patient_Type_Estimate = coef_table["Patient_TypeATH", "Estimate"],
+    Patient_Type_P = coef_table["Patient_TypeATH", "Pr(>|t|)"],
+    T2_Status_Estimate = coef_table["T2_StatusLow", "Estimate"],
+    T2_Status_P = coef_table["T2_StatusLow", "Pr(>|t|)"],
+    Interaction_Estimate = coef_table["Patient_TypeATH:T2_StatusLow", "Estimate"],
+    Interaction_P = coef_table["Patient_TypeATH:T2_StatusLow", "Pr(>|t|)"]
+  )
+}))
+
+library(ggplot2)
+
+# create a dataframe with variables
+plot_data <- data.frame(
+  ME = module_eigengenes$MEblack,  # replace MEname with your module
+  Patient_Type = phenoData$Patient_Type,
+  T2_Status = phenoData$T2_Status
+)
+
+ggplot(plot_data, aes(x = T2_Status, y = ME, color = Patient_Type, group = Patient_Type)) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1) +
+  theme_minimal() +
+  labs(title = "Interaction plot: MEblack", y = "Module eigengene")
+
+# create a dataframe with variables
+plot_data <- data.frame(
+  ME = module_eigengenes$MEturquoise,  # replace MEname with your module
+  Patient_Type = phenoData$Patient_Type,
+  T2_Status = phenoData$T2_Status
+)
+
+ggplot(plot_data, aes(x = T2_Status, y = ME, color = Patient_Type, group = Patient_Type)) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1) +
+  theme_minimal() +
+  labs(title = "Interaction plot: MEturquoise", y = "Module eigengene")
+```
+
+```{r}
+library(dplyr)
+
+samples_t2high <- phenoData.subset %>% filter(T2_Status == "High") %>% rownames()
+# Assuming phenoData is your full metadata dataframe
+# and you have a column called 'T2_status' or similar to identify T2-high
+
+phenoData.t2high <- phenoData.subset %>%
+  filter(T2_Status == "High")  
+
+
+samples_t2low  <- phenoData.subset %>% filter(T2_Status == "Low") %>% rownames()
+phenoData.t2low <- phenoData.subset %>%
+  filter(T2_Status == "Low")  
+
+```
+
+```{r}
+norm.counts.t2high <- norm.counts[samples_t2high, ]
+dim(norm.counts.t2high)
+norm.counts.t2low  <- norm.counts[samples_t2low, ]
+dim(norm.counts.t2low)
+```
+
+```{r}
+# T2High
+powers <- c(1:10, seq(12, 20, 2))
+sft.high <- pickSoftThreshold(norm.counts.t2high, powerVector = powers,
+                              networkType = "signed", verbose = 5)
+
+# plot
+plot(sft.high$fitIndices$Power, sft.high$fitIndices$SFT.R.sq,
+     xlab="Soft Threshold (power)", ylab="Scale Free Topology Model Fit, signed R^2",
+     type="b", main="T2High - Scale Free Topology")
+
+# T2Low
+sft.low <- pickSoftThreshold(norm.counts.t2low, powerVector = powers,
+                             networkType = "signed", verbose = 5)
+
+# plot
+plot(sft.low$fitIndices$Power, sft.low$fitIndices$SFT.R.sq,
+     xlab="Soft Threshold (power)", ylab="Scale Free Topology Model Fit, signed R^2",
+     type="b", main="T2Low - Scale Free Topology")
+
+```
+
+```{r}
+power_high <- 10  
+power_low <- 18   
+
+# T2High network
+net.t2high <- blockwiseModules(norm.counts.t2high,
+                               power = power_high,
+                               TOMType = "signed",
+                               minModuleSize = 30,
+                               numericLabels = FALSE,
+                               verbose = 3,
+                               maxBlockSize = 20000)
+
+# T2Low network
+net.t2low <- blockwiseModules(norm.counts.t2low,
+                              power = power_low,
+                              TOMType = "signed",
+                              minModuleSize = 30,
+                              mergeCutHeight = 0.25,
+                              numericLabels = FALSE,
+                              verbose = 3,
+                              maxBlockSize = 20000)
+
+
+
+```
+
+```{r}
+length(net.t2high$dendrograms)
+
+```
+
+```{r}
+# Cluster Dendrogram for T2_High
+plotDendroAndColors(net.t2high$dendrograms[[1]], 
+                    net.t2high$colors,
+                    groupLabels = c("Module Colors"),
+                    dendroLabels = FALSE,
+                    addGuide = TRUE,
+                    hang = 0.03,
+                    guideHang = 0.05)
+
+
+```
+```{r}
+# Cluster Dendrogram for T2_Low
+plotDendroAndColors(net.t2low$dendrograms[[1]], 
+                    cbind(net.t2low$unmergedColors, net.t2low$colors),
+                    c("unmerged","merged"),
+                    dendroLabels = FALSE,
+                    addGuide = TRUE,
+                    hang = 0.03,
+                    guideHang = 0.05)
+
+
+```
+
+```{r}
+MEs.t2high <- net.t2high$MEs
+dim(MEs.t2high)
+MEs.t2low  <- net.t2low$MEs
+dim(MEs.t2low)
+```
+
+```{r}
+# create traits file - binarize categorical variables
+traits_T2_HIGH<- phenoData.subset %>% 
+  mutate(Steroid_status = ifelse(grepl('ACS', Patient_Type), 1, 0)) %>%
+  select(Steroid_status)
+
+# combine the traitsÍ
+traits <- cbind(traits_T2_HIGH)
+```
+
+```{r}
+# Step 5: Create traits (ICS status binarized for T2 High samples
+traits_T2_HIGH <- phenoData.t2high %>% 
+  mutate(Steroid_status = ifelse(grepl('ACS', Patient_Type), 1, 0)) %>%
+  select(Steroid_status)
+
+# Ensure rownames match sample names in MEs
+rownames(traits_T2_HIGH) <- rownames(phenoData.t2high)
+
+# Step 6: Module-trait correlation
+nSamples.high <- nrow(norm.counts.t2high)
+nGenes.high <- ncol(norm.counts.t2high)
+
+module.trait.corr.high <- cor(MEs.t2high, traits_T2_HIGH, use = "p")
+module.trait.corr.pvals.high <- corPvalueStudent(module.trait.corr.high, nSamples.high)
+
+# Create combined text matrix (correlation + p-value)
+textMatrix.high <- matrix("", nrow = nrow(module.trait.corr.high), ncol = ncol(module.trait.corr.high))
+for (i in 1:nrow(module.trait.corr.high)) {
+  for (j in 1:ncol(module.trait.corr.high)) {
+    # Format: "0.75 (0.01)" - correlation value with p-value in parentheses
+    textMatrix.high[i, j] <- paste(signif(module.trait.corr.high[i, j], 2), 
+                                  " (", signif(module.trait.corr.pvals.high[i, j], 2), ")", sep="")
+  }
+}
+
+# Heatmap visualization (using labeledHeatmap from WGCNA)
+labeledHeatmap(Matrix = module.trait.corr.high,
+               xLabels = names(traits_T2_HIGH),
+               yLabels = names(MEs.t2high),
+               ySymbols = names(MEs.t2high),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix.high,  # Display correlation and p-value on same line
+               setStdMargins = FALSE,
+               cex.text = 0.6,
+               zlim = c(-1, 1),
+               main = "Module-trait correlations (T2 High)")
+
+# OPTIONAL: print correlation and p-value matrices
+print(module.trait.corr.high)
+print(module.trait.corr.pvals.high)
+
+# Step 7: Module membership
+module.membership.measure.high <- cor(norm.counts.t2high, MEs.t2high, use = 'p')
+module.membership.measure.pvals.high <- corPvalueStudent(module.membership.measure.high, nSamples.high)
+
+# Check first few rows/columns
+module.membership.measure.pvals.high[1:7, 1:17]
+dim(module.membership.measure.pvals.high)
+```
+```{r}
+# Identify modules with significant correlation to steroid status
+significant_modules <- which(module.trait.corr.pvals.high[, "Steroid_status"] < 0.1)
+significant_module_names <- rownames(module.trait.corr.pvals.high)[significant_modules]
+cat("Modules significantly associated with steroid status:", paste(significant_module_names, collapse=", "), "\n")
+
+# For the most significant module
+if(length(significant_modules) > 0) {
+  top_module <- significant_module_names[which.min(module.trait.corr.pvals.high[significant_modules, "Steroid_status"])]
+  cat("Most significant module:", top_module, "\n")
+  
+  # Get genes in this module with high module membership
+  module_column <- match(top_module, names(MEs.t2high))
+  MM <- abs(module.membership.measure.high[, module_column])
+  MM_pvals <- module.membership.measure.pvals.high[, module_column]
+  
+  # Select genes with high MM and significant p-values
+  top_genes <- names(sort(MM[MM_pvals < 0.05], decreasing = TRUE)[1:20])
+  cat("Top 20 genes in module:", paste(top_genes, collapse=", "), "\n")
+}
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(forcats)
+
+# Helper: ensure "ME" prefix only once
+.ensure_me_prefix <- function(x) ifelse(startsWith(x, "ME"), x, paste0("ME", x))
+
+# Generic plotting helper using your style
+.make_mt_plot <- function(corr_mat, title_str, lims = c(-0.4, 0.4)) {
+  # Melt to long format
+  df.long <- melt(corr_mat, varnames = c("Module", "Trait"), value.name = "Correlation")
+  
+  # Order modules by max correlation (descending) and add "ME" prefix (once)
+  df.long <- df.long %>%
+    mutate(Module = .ensure_me_prefix(as.character(Module))) %>%
+    group_by(Module) %>%
+    mutate(.max_corr = max(Correlation, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(Module = fct_reorder(Module, .max_corr, .desc = TRUE)) %>%
+    select(-.max_corr)
+  
+  ggplot(df.long, aes(x = Trait, y = Module, fill = Correlation)) +
+    geom_tile(color = "black", linewidth = 0.6, width = 0.9, height = 0.9) +
+    geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3, fontface = "bold") +
+    scale_fill_gradient2(
+      low = "#113F67", mid = "white", high = "#DC143C",
+      midpoint = 0, limits = lims, oob = scales::squish
+    ) +
+    scale_x_discrete(expand = c(0, 0)) +
+    scale_y_discrete(expand = c(0, 0)) +
+    labs(title = title_str, x = "", y = "", fill = "Correlation") +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+      axis.text.y = element_text(size = 9),
+      plot.title  = element_text(size = 11, face = "bold", hjust = 0.5),
+      legend.key.height = unit(0.4, "cm"),
+      legend.key.width  = unit(0.4, "cm"),
+      legend.text  = element_text(size = 9),
+      legend.title = element_text(size = 11, face = "bold")
+    ) +
+    coord_fixed(ratio = 0.2)
+}
+
+# ---- Build the two plots ----
+p_high <- .make_mt_plot(corr_high, title_str = "T2 High Steroid Module-Trait Associations")
+p_low  <- .make_mt_plot(corr_low,  title_str = "T2 Low Steroid Module-Trait Associations")
+
+# Show them
+p_high
+p_low
+
+# Optional: side-by-side with patchwork
+# library(patchwork)
+# p_high + p_low + plot_layout(ncol = 2)
+
+
+```
+```{r}
+# ---- thresholds ----
+GS_thresh <- 0.4
+MM_thresh <- 0.6
+
+# ---- build steroid trait for each group (ACS = 1, else 0) ----
+traits_T2_HIGH <- phenoData.t2high |>
+  dplyr::mutate(Steroid_status = ifelse(grepl("ACS", Patient_Type), 1, 0)) |>
+  dplyr::select(Steroid_status)
+rownames(traits_T2_HIGH) <- rownames(phenoData.t2high)
+
+traits_T2_LOW <- phenoData.t2low |>
+  dplyr::mutate(Steroid_status = ifelse(grepl("ACS", Patient_Type), 1, 0)) |>
+  dplyr::select(Steroid_status)
+rownames(traits_T2_LOW) <- rownames(phenoData.t2low)
+
+# ---- sanity: sample alignment ----
+stopifnot(identical(rownames(norm.counts.t2high), rownames(MEs.t2high)))
+stopifnot(identical(rownames(norm.counts.t2low),  rownames(MEs.t2low)))
+stopifnot(identical(rownames(norm.counts.t2high), rownames(traits_T2_HIGH)))
+stopifnot(identical(rownames(norm.counts.t2low),  rownames(traits_T2_LOW)))
+
+# ---- Module Membership (MM): genes × modules ----
+module.membership.measure.high <- cor(norm.counts.t2high, MEs.t2high, use = "pairwise.complete.obs")
+module.membership.measure.low  <- cor(norm.counts.t2low,  MEs.t2low,  use = "pairwise.complete.obs")
+
+# ---- Gene Significance (GS): correlation (gene, Steroid_status) ----
+GS.high <- as.data.frame(cor(norm.counts.t2high, traits_T2_HIGH$Steroid_status,
+                             use = "pairwise.complete.obs"))
+GS.low  <- as.data.frame(cor(norm.counts.t2low,  traits_T2_LOW$Steroid_status,
+                             use = "pairwise.complete.obs"))
+colnames(GS.high) <- "GS"; colnames(GS.low) <- "GS"
+
+# ---- helper to find the right MM column name for a given module color ----
+.get_mm_col <- function(mm_mat, module_color) {
+  cand <- c(paste0("ME", module_color), module_color)
+  idx <- which(tolower(colnames(mm_mat)) %in% tolower(cand))
+  if (length(idx) == 0) {
+    # fallback: suffix match (handles e.g., "MEgrey60" vs "grey60")
+    idx <- grep(paste0(module_color, "$"), colnames(mm_mat), ignore.case = TRUE)
+  }
+  if (length(idx) == 0) {
+    stop("MM column for module ", module_color, " not found. Available: ",
+         paste(colnames(mm_mat), collapse = ", "))
+  }
+  colnames(mm_mat)[idx[1]]
+}
+
+# ---- generic filter function (by module color, thresholds) ----
+.filter_genes <- function(net_colors, mm_mat, gs_vec, module_color) {
+  module_genes <- names(net_colors)[net_colors == module_color]
+  if (!length(module_genes)) return(character(0))
+
+  mm_col <- .get_mm_col(mm_mat, module_color)
+  common <- intersect(intersect(module_genes, rownames(mm_mat)), rownames(gs_vec))
+  if (!length(common)) return(character(0))
+
+  MM <- mm_mat[common, mm_col, drop = TRUE]
+  GS <- gs_vec[common, "GS", drop = TRUE]
+
+  common[abs(GS) > GS_thresh & abs(MM) > MM_thresh]
+}
+
+# ---- apply filters for requested modules ----
+# T2-High: lightyellow, grey60, violet
+genes.lightyellow_high <- .filter_genes(net.t2high$colors, module.membership.measure.high, GS.high, "lightyellow")
+genes.grey60_high      <- .filter_genes(net.t2high$colors, module.membership.measure.high, GS.high, "grey60")
+genes.violet_high      <- .filter_genes(net.t2high$colors, module.membership.measure.high, GS.high, "violet")
+
+# T2-Low: blue, grey
+genes.blue_low <- .filter_genes(net.t2low$colors, module.membership.measure.low, GS.low, "blue")
+genes.grey_low <- .filter_genes(net.t2low$colors, module.membership.measure.low, GS.low, "grey")
+
+# ---- write the two CSVs with modules grouped in your order ----
+outdir <- "wgcna_module_genes"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# T2-High CSV: lightyellow -> grey60 -> violet
+df_high <- rbind(
+  data.frame(Module = "lightyellow", Gene = unique(genes.lightyellow_high), stringsAsFactors = FALSE),
+  data.frame(Module = "grey60",      Gene = unique(genes.grey60_high),      stringsAsFactors = FALSE),
+  data.frame(Module = "violet",      Gene = unique(genes.violet_high),      stringsAsFactors = FALSE)
+)
+high_path <- file.path(outdir, "T2High_steroid_genes.csv")
+write.csv(df_high, high_path, row.names = FALSE)
+
+# T2-Low CSV: blue -> grey
+df_low <- rbind(
+  data.frame(Module = "blue", Gene = unique(genes.blue_low), stringsAsFactors = FALSE),
+  data.frame(Module = "grey", Gene = unique(genes.grey_low), stringsAsFactors = FALSE)
+)
+low_path <- file.path(outdir, "T2Low_steroid_genes.csv")
+write.csv(df_low, low_path, row.names = FALSE)
+
+message("Wrote: ", high_path, " [lightyellow=", sum(df_high$Module=="lightyellow"),
+        ", grey60=", sum(df_high$Module=="grey60"),
+        ", violet=", sum(df_high$Module=="violet"), "]")
+message("Wrote: ", low_path,  " [blue=", sum(df_low$Module=="blue"),
+        ", grey=", sum(df_low$Module=="grey"), "]")
+
+
+```
+
+```{r}
+dir.create("Only_T2high_ICS", showWarnings = FALSE)
+
+module_gene_mapping_high <- as.data.frame(net.t2high$colors)
+
+lightyellow_genes <- module_gene_mapping_high %>%
+  filter(net.t2high$colors== 'lightyellow') %>%
+  rownames()
+
+# Calculate the gene significance and associated p-values
+gene.significance.corr.T2.high <- cor(norm.counts.t2high, traits_T2_HIGH$Steroid_status, use ='p')
+gene.significance.corr.pvals.T2.high <- corPvalueStudent(gene.significance.corr.T2.high, nSamples.high)
+
+# Module membership and gene significance
+# Correct subsetting
+lightyellow_MM.high <- module.membership.measure.high[lightyellow_genes, "MElightyellow"]
+lightyellow_GS.high <- gene.significance.corr[lightyellow_genes, 1]
+
+# Plot MM vs GS
+highlight_genes.high <- abs(lightyellow_MM.high) > 0.8 & abs(lightyellow_GS.high) > 0.2
+point_colors <- ifelse(highlight_genes.high, "red", "yellow2")
+
+pdf("Only_T2high_ICS/Only_T2high_ICS_use_MM_vs_GS.pdf")
+verboseScatterplot(abs(lightyellow_MM.high), abs(lightyellow_GS.high),
+  xlab = "Module Membership in Light Yellow Module",
+  ylab = "Gene Significance for ICS Use in T2High samples",
+  main = "MM vs. GS: Yellow Module vs ICS Use in T2 High samples",
+  col = point_colors, cex = 1.5, cex.lab = 1.3, cex.axis = 1.2, cex.main = 0.6)
+dev.off()
+
+# Extract red (hub) genes
+hub_genes <- lightyellow_genes[highlight_genes.high]
+
+# GO enrichment analysis
+if (length(hub_genes) > 0) {
+  gene_df <- bitr(hub_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+  ego <- enrichGO(
+    gene = gene_df$ENTREZID,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = "ALL",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2,
+    readable = TRUE
+  )
+
+  ego_df <- as.data.frame(ego)
+  write.csv(ego_df[1:20, c("ID", "Description", "Count", "p.adjust", "geneID")],
+            "Only_T2high_ICS/GO_lightyellow_T2high.csv", row.names = FALSE)
+
+  # Prepare for barplot
+  top_terms <- ego_df %>%
+    mutate(ONTOLOGY = factor(ONTOLOGY, levels = c("BP", "CC", "MF"))) %>%
+    group_by(ONTOLOGY) %>%
+    slice_min(order_by = p.adjust, n = 8) %>%
+    ungroup() %>%
+    mutate(Description = str_wrap(Description, width = 40))
+
+  # Plot barplot
+  p <- ggplot(top_terms, aes(x = Count, y = reorder(Description, -p.adjust), fill = p.adjust)) +
+    geom_bar(stat = "identity") +
+    facet_grid(rows = vars(ONTOLOGY), scales = "free_y", space = "free_y") +
+    scale_fill_gradientn(
+      colors = c("red", "magenta", "blue"),
+      values = c(0, 0.5, 1),
+      name = "p.adjust"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.major.y = element_line(color = "grey80", size = 0.3),
+      panel.grid.major.x = element_line(color = "grey90", size = 0.2),
+      panel.border = element_rect(color = "black", fill = NA, size = 0.6),
+      strip.background = element_rect(fill = "grey95", color = "black", size = 0.5),
+      strip.text.y = element_text(angle = 0, size = 14, face = "bold"),
+      axis.text.y = element_text(size = 9),
+      axis.text.x = element_text(size = 10),
+      axis.title = element_text(size = 16),
+      panel.spacing = unit(1, "lines")
+    ) +
+    labs(
+      x = "Count",
+      y = NULL,
+      title = "GO Enrichment by Ontology - Light Yellow Module (T2 High ICS Use)"
+    )
+
+  ggsave("Only_T2high_ICS/lightyellow_module_GO_barplot.pdf", plot = p, width = 10, height = 8)
+}
+```
+
+T2 Low - ICS Use 
+
+```{r}
+# ------------------ T2 Low - Blue Module Analysis ------------------
+
+# Load required libraries
+library(WGCNA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+# Create output directory
+dir.create("T2Low_Blue_GO", showWarnings = FALSE)
+
+# Extract gene significance and MM for blue module in T2 Low
+module_gene_mapping_low <- as.data.frame(net.t2low$colors)
+blue_genes <- module_gene_mapping_low %>%
+  filter(net.t2low$colors == 'blue') %>%
+  rownames()
+
+gene.significance.corr.T2.low <- cor(norm.counts.t2low, traits_T2_LOW$Steroid_status, use = 'p')
+gene.significance.corr.pvals.T2.low <- corPvalueStudent(gene.significance.corr.T2.low, nrow(norm.counts.t2low))
+
+# Module membership
+module.membership.measure.low <- cor(norm.counts.t2low, net.t2low$MEs, use = 'p')
+blue_MM.low <- module.membership.measure.low[blue_genes, "MEblue"]
+blue_GS.low <- gene.significance.corr.T2.low[blue_genes, 1]
+
+# Identify hub genes (MM > 0.8 & GS > 0.4)
+highlight_genes.low <- abs(blue_MM.low) > 0.8 & abs(blue_GS.low) > 0.4
+red_genes <- blue_genes[highlight_genes.low]
+
+# Save MM vs GS plot
+point_colors <- ifelse(highlight_genes.low, "red", "blue")
+pdf("T2Low_Blue_GO/blue_module_MM_vs_GS_T2Low.pdf")
+verboseScatterplot(
+  x = abs(blue_MM.low),
+  y = abs(blue_GS.low),
+  xlab = "Module Membership in Blue Module",
+  ylab = "Gene Significance for ICS Use",
+  main = "MM vs. GS: Blue Module (T2 Low, Red = MM > 0.8 & GS > 0.4)",
+  col = point_colors,
+  cex = 1.5,
+  cex.lab = 1.3,
+  cex.axis = 1.2,
+  cex.main = 0.8
+)
+dev.off()
+
+# Save red (hub) genes
+red_genes_df <- data.frame(GeneSymbol = red_genes)
+write.csv(red_genes_df, "T2Low_Blue_GO/blue_module_red_genes_T2Low.csv", row.names = FALSE)
+
+# ------------------ GO Enrichment ------------------
+
+# Perform enrichment
+gene_df <- bitr(red_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+ego <- enrichGO(
+  gene = gene_df$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+# Save top 20 GO terms
+ego_df <- as.data.frame(ego)
+write.csv(ego_df[1:20, c("ID", "Description", "Count", "p.adjust", "geneID")],
+          "T2Low_Blue_GO/GO_T2Low_MEblue.csv", row.names = FALSE)
+
+# ------------------ Faceted GO Barplot ------------------
+
+top_terms <- ego_df %>%
+  mutate(ONTOLOGY = factor(ONTOLOGY, levels = c("BP", "CC", "MF"))) %>%
+  group_by(ONTOLOGY) %>%
+  slice_min(order_by = p.adjust, n = 8) %>%
+  ungroup() %>%
+  mutate(Description = stringr::str_wrap(Description, width = 40))
+
+p <- ggplot(top_terms, aes(x = Count, y = reorder(Description, -p.adjust), fill = p.adjust)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(ONTOLOGY), scales = "free_y", space = "free_y") +
+  scale_fill_gradientn(
+    colors = c("red", "magenta", "blue"),
+    values = c(0, 0.5, 1),
+    name = "p.adjust"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_line(color = "grey80", size = 0.3),
+    panel.grid.major.x = element_line(color = "grey90", size = 0.2),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.6),
+    strip.background = element_rect(fill = "grey95", color = "black", size = 0.5),
+    strip.text.y = element_text(angle = 0, size = 14, face = "bold"),
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    panel.spacing = unit(1, "lines")
+  ) +
+  labs(
+    x = "Count",
+    y = NULL,
+    title = "GO Enrichment by Ontology - Blue Module (T2 Low ICS Use)"
+  )
+
+ggsave("T2Low_Blue_GO/blue_module_GO_barplot_T2Low.pdf", plot = p, width = 10, height = 10)
+
+```
+
+
+
+```{r}
+library(dplyr)
+library(WGCNA)
+
+# ---- Inputs you already have ----
+# norm.counts: samples × genes (what you used for WGCNA)
+# bwnet$colors: module color per gene (names must be gene names)
+# module_eigengenes <- bwnet$MEs
+# module.membership.measure <- cor(module_eigengenes, norm.counts, use = "p")
+# traits with Asthma column; GS computed below
+stopifnot(all(colnames(norm.counts) %in% names(bwnet$colors)))
+moduleColors <- bwnet$colors
+names(moduleColors) <- colnames(norm.counts)
+
+# --- thresholds ---
+GS_thresh <- 0.2
+MM_thresh <- 0.1
+target_colors <- c("yellow","blue","brown","red")  # edit as needed
+
+# --- compute GS (Asthma) if not already a named vector ---
+gene.significance.corr <- cor(norm.counts, traits$Asthma, use = "p")
+if (is.matrix(gene.significance.corr) || is.data.frame(gene.significance.corr)) {
+  GS_vec <- setNames(as.numeric(gene.significance.corr[,1]), rownames(gene.significance.corr))
+} else {
+  GS_vec <- gene.significance.corr
+}
+
+# ---- helper: safe pull of MM for a given module ----
+get_mm <- function(MEname, genes) {
+  # module.membership.measure has rows=ME names, cols=genes
+  MEname <- as.character(MEname)
+  genes  <- intersect(genes, colnames(module.membership.measure))
+  if (!MEname %in% rownames(module.membership.measure))
+    stop("ME row not found in module.membership.measure: ", MEname)
+  mm <- as.numeric(module.membership.measure[MEname, genes, drop = TRUE])
+  names(mm) <- genes
+  mm
+}
+
+# ---- build hub table over selected modules ----
+hub_table <- lapply(target_colors, function(col) {
+  MEname <- paste0("ME", col)
+  genes  <- names(moduleColors)[moduleColors == col]
+
+  # MM for these genes IN THIS MODULE (correct orientation!)
+  mm <- get_mm(MEname, genes)
+
+  # GS for these genes
+  gs <- GS_vec[genes]
+  gs <- setNames(as.numeric(gs), names(gs))
+
+  df <- tibble(
+    Gene   = genes,
+    Module = col,
+    MM     = mm[genes],
+    GS     = gs[genes]
+  ) |>
+    mutate(absMM = abs(MM), absGS = abs(GS)) |>
+    filter(absMM > MM_thresh, absGS > GS_thresh) |>
+    arrange(desc(absMM), desc(absGS))
+  df
+}) |>
+  bind_rows()
+
+dir.create("Asthma_hub_GO/top_hubs", showWarnings = FALSE, recursive = TRUE)
+write.csv(hub_table, "Asthma_hub_GO/top_hubs/hubs_GS0.2_MM0.8.csv", row.names = FALSE)
+```
+
+
+
+```{r}
+library(reshape2)
+library(ggplot2)
+
+# Step 1: calculate correlations for the selected traits
+traits.keep <- c("Asthma", "T2_High", "T2_Low")
+
+# module-trait correlation subset
+module.trait.sub <- module.trait.corr[, traits.keep, drop = FALSE]
+
+# Step 2: clean up column names for prettier plotting
+colnames(module.trait.sub) <- c("Asthma", "T2 High", "T2 Low")
+
+# Step 3: melt into long format
+df.long <- melt(module.trait.sub, varnames = c("Module", "Trait"), value.name = "Correlation")
+
+# Step 4: make the heatmap
+p <- ggplot(df.long, aes(x = Trait, y = Module, fill = Correlation)) +
+  # add tile borders with color + thickness
+  geom_tile(color = "black", linewidth = 0.6) +
+  scale_fill_gradient2(low = "#113F67", mid = "white", high = "#DC143C", midpoint = 0) +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.margin = margin(10, 40, 10, 10),
+    #panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2) # box around whole plot
+  ) +
+  labs(title = "Module–Trait Associations in Asthma and T2 Subtypes", x = "", y = "", fill = "Correlation")
+
+# Step 5: widen the plot
+p + theme(
+  plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+  plot.margin = margin(10, 80, 10, 10)
+)
+```
+
+```{r}
+# ---- Inputs ----
+trait_col <- "Asthma"   # change if needed
+modules_of_interest <- c("blue", "red", "brown", "yellow")  # order you want
+gs_thr <- 0.2
+mm_thr <- 0.2
+use_abs <- TRUE
+
+# ---- Gene significance (GS) ----
+trait_vec <- traits[[trait_col]]
+GS <- cor(norm.counts, trait_vec, use = "p")
+if (use_abs) GS <- abs(GS)
+
+# ---- Align module colors to genes ----
+gene_ids <- colnames(norm.counts)
+colors_vec <- as.vector(bwnet$colors[gene_ids])
+names(colors_vec) <- gene_ids
+
+# ---- Get MM (kME) per gene to its own module ----
+row_me_names <- rownames(module.membership.measure)
+MM <- vapply(seq_along(gene_ids), function(i) {
+  me_row <- paste0("ME", colors_vec[i])
+  j <- match(me_row, row_me_names)
+  if (is.na(j)) return(NA_real_)
+  module.membership.measure[j, i]
+}, numeric(1))
+if (use_abs) MM <- abs(MM)
+
+# ---- Build dataframe ----
+df_all <- data.frame(
+  gene   = gene_ids,
+  module = colors_vec,
+  GS     = GS,
+  MM     = MM,
+  stringsAsFactors = FALSE
+)
+
+# ---- Filter ----
+df_filtered <- subset(
+  df_all,
+  module %in% modules_of_interest &
+    !is.na(GS) & !is.na(MM) &
+    GS > gs_thr & MM > mm_thr
+)
+
+# ---- Group rows by module (fixed order) ----
+df_filtered$module <- factor(df_filtered$module, levels = modules_of_interest)
+df_grouped <- df_filtered[order(df_filtered$module), ]
+
+# ---- Save ----
+write.csv(df_grouped, "genes_positive_correlation.csv", row.names = FALSE)
+
+# Preview
+head(df_grouped)
+
+
+```
+
+```{r}
+# ---- Inputs ----
+trait_col <- "Asthma"   # change if needed
+modules_of_interest <- c("black", "turquoise", "grey", "green")  # new set
+gs_thr <- 0.2
+mm_thr <- 0.2
+use_abs <- TRUE
+
+# ---- Gene significance (GS) ----
+trait_vec <- traits[[trait_col]]
+GS <- cor(norm.counts, trait_vec, use = "p")
+if (use_abs) GS <- abs(GS)
+
+# ---- Align module colors to genes ----
+gene_ids <- colnames(norm.counts)
+colors_vec <- as.vector(bwnet$colors[gene_ids])
+names(colors_vec) <- gene_ids
+
+# ---- Get MM (kME) per gene to its own module ----
+row_me_names <- rownames(module.membership.measure)
+MM <- vapply(seq_along(gene_ids), function(i) {
+  me_row <- paste0("ME", colors_vec[i])
+  j <- match(me_row, row_me_names)
+  if (is.na(j)) return(NA_real_)
+  module.membership.measure[j, i]
+}, numeric(1))
+if (use_abs) MM <- abs(MM)
+
+# ---- Build dataframe ----
+df_all <- data.frame(
+  gene   = gene_ids,
+  module = colors_vec,
+  GS     = GS,
+  MM     = MM,
+  stringsAsFactors = FALSE
+)
+
+# ---- Filter ----
+df_filtered <- subset(
+  df_all,
+  module %in% modules_of_interest &
+    !is.na(GS) & !is.na(MM) &
+    GS > gs_thr & MM > mm_thr
+)
+
+# ---- Group rows by module (fixed order) ----
+df_filtered$module <- factor(df_filtered$module, levels = modules_of_interest)
+df_grouped <- df_filtered[order(df_filtered$module), ]
+
+# ---- Save ----
+write.csv(df_grouped, "genes_negative_correlation.csv", row.names = FALSE)
+
+# Preview
+head(df_grouped)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Install/Load ----
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(magrittr)
+  library(tidyverse)   # ggplot2, readr, tidyr, etc.
+  library(WGCNA)
+  library(DESeq2)
+  library(gridExtra)
+  library(psych)
+  library(CorLevelPlot)
+  library(org.Hs.eg.db)
+  library(clusterProfiler)
+  library(broom)       # for tidy() on lm fits
+})
+
+allowWGCNAThreads()
+options(stringsAsFactors = FALSE)
+
+# Load counts and pre=processing
+# Counts ----
+data <- read.csv("all_counts.csv", stringsAsFactors = FALSE) %>%
+  na.omit() %>%
+  group_by(Gene = .[[1]]) %>%          # collapse duplicate gene rows if any
+  summarise(across(-1, ~ round(sum(.)))) %>%
+  as.data.frame() %>%
+  { rownames(.) <- .$Gene; .[, -1, drop = FALSE] }
+
+# Metadata (samples in rows) ----
+phenoData <- read.csv("metadata.csv", row.names = 1, stringsAsFactors = FALSE)
+
+# Basic alignment checks (samples = columns of counts)
+stopifnot(all(rownames(phenoData) %in% colnames(data)))
+phenoData <- phenoData[colnames(data), , drop = FALSE]
+
+
+# Quality control
+# WGCNA expects samples in rows, genes in columns -> transpose for diagnostic only
+gsg <- goodSamplesGenes(t(data))
+if (!gsg$allOK) {
+  data <- data[gsg$goodGenes, , drop = FALSE]
+}
+
+# (Optional) outlier inspection ----
+htree <- hclust(dist(t(data)), method = "average")
+plot(htree, main = "Sample clustering (raw)")
+
+pca <- prcomp(t(data))
+pca.dat <- as.data.frame(pca$x)
+pvar <- round(pca$sdev^2 / sum(pca$sdev^2) * 100, 2)
+ggplot(pca.dat, aes(PC1, PC2, label = rownames(pca.dat))) +
+  geom_point() + geom_text(nudge_y = 0.5, size = 3) +
+  labs(x = paste0("PC1: ", pvar[1], "%"), y = paste0("PC2: ", pvar[2], "%")) +
+  theme_classic()
+
+# Remove specific outliers if needed (empty here)
+samples.to.be.excluded <- character(0)
+data.subset <- data[, !(colnames(data) %in% samples.to.be.excluded), drop = FALSE]
+phenoData.subset <- phenoData[!(rownames(phenoData) %in% samples.to.be.excluded), , drop = FALSE]
+
+# Sanity
+stopifnot(identical(rownames(phenoData.subset), colnames(data.subset)))
+
+
+# Preprocess
+# Build DESeq2 object ----
+dds <- DESeqDataSetFromMatrix(countData = data.subset,
+                              colData   = phenoData.subset,
+                              design    = ~ 1)
+
+# Filter low counts: keep genes with >= 15 counts in at least 75% samples
+min_count <- 15
+keep_n    <- ceiling(ncol(dds) * 0.75)
+dds75 <- dds[rowSums(counts(dds) >= min_count) >= keep_n, ]
+message("Genes kept after filter: ", nrow(dds75))
+
+# Variance stabilizing transform -> WGCNA-friendly expression
+dds_norm <- vst(dds75, blind = TRUE)
+
+# WGCNA format: samples in rows, genes in columns
+norm.counts <- t(assay(dds_norm))
+
+# For safety, everything numeric
+storage.mode(norm.counts) <- "double"
+
+# Choose power and build network
+# Soft-threshold selection (signed network) ----
+powers <- c(1:10, 12, 14, 16, 18, 20)
+sft <- pickSoftThreshold(norm.counts, powerVector = powers,
+                         networkType = "signed", verbose = 5)
+fi <- sft$fitIndices
+soft_power <- if (any(fi$SFT.R.sq >= 0.8)) {
+  fi$Power[min(which(fi$SFT.R.sq >= 0.8))]
+} else fi$Power[which.max(fi$SFT.R.sq)]
+message("Chosen soft power = ", soft_power)
+
+# Visual check (optional)
+a1 <- ggplot(fi, aes(Power, SFT.R.sq, label = Power)) +
+  geom_point() + geom_text(nudge_y = 0.06, size = 3) +
+  geom_hline(yintercept = 0.8, color = "red") + theme_classic() +
+  labs(y = "Scale-free Topology (R^2)")
+a2 <- ggplot(fi, aes(Power, mean.k., label = Power)) +
+  geom_point() + geom_text(vjust = -0.8, size = 3) +
+  theme_classic() + labs(y = "Mean connectivity")
+gridExtra::grid.arrange(a1, a2, nrow = 2)
+
+# Network ----
+bwnet <- blockwiseModules(
+  norm.counts,
+  power               = soft_power,
+  TOMType             = "signed",
+  minModuleSize       = 30,
+  mergeCutHeight      = 0.25,
+  numericLabels       = FALSE,
+  pamRespectsDendro   = TRUE,
+  maxBlockSize        = 20000,
+  verbose             = 3
+)
+
+module_colors <- bwnet$colors
+module_eigengenes <- bwnet$MEs          # rows = samples, cols = MEs
+
+# Interaction model
+# Design: Subtype(High=1, Low=0) and Steroid(ACS=1) ----
+design <- phenoData.subset %>%
+  mutate(
+    Subtype = case_when(T2_Status == "High" ~ 1L,
+                        T2_Status == "Low"  ~ 0L,
+                        TRUE ~ NA_integer_),      # drop NA/Healthy for this part
+    Steroid = as.integer(grepl("ACS", patient_type))
+  ) %>%
+  select(Subtype, Steroid) %>%
+  filter(!is.na(Subtype))
+
+# Align to MEs
+common <- intersect(rownames(design), rownames(module_eigengenes))
+design <- design[common, , drop = FALSE]
+MEs_for_lm <- module_eigengenes[common, , drop = FALSE]
+stopifnot(identical(rownames(design), rownames(MEs_for_lm)))
+
+# Fit ME ~ Subtype * Steroid for each module
+results_list <- lapply(colnames(MEs_for_lm), function(me) {
+  df <- cbind(ME = MEs_for_lm[, me], design)
+  fit <- lm(ME ~ Subtype * Steroid, data = df)
+  broom::tidy(fit) %>% mutate(Module = me)
+})
+results_df <- bind_rows(results_list)
+
+# Heatmap of coefficients
+coef_mat <- results_df %>%
+  select(Module, term, estimate) %>%
+  tidyr::pivot_wider(names_from = term, values_from = estimate)
+
+p_interaction <- ggplot(coef_mat %>%
+                          tidyr::pivot_longer(-Module, names_to = "Effect", values_to = "Beta"),
+                        aes(Effect, Module, fill = Beta)) +
+  geom_tile(color = "black") +
+  geom_text(aes(label = sprintf("%.2f", Beta)), size = 3, fontface = "bold") +
+  scale_fill_gradient2(low = "#113F67", mid = "white", high = "#DC143C", midpoint = 0) +
+  labs(title = "Subtype × Steroid effects on Module Eigengenes", x = "", y = "", fill = "β") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_interaction)
+
+
+# 4 column subgroup heatmap
+# Helper: lock ME signs to module gene means (prevents arbitrary flips) ----
+align_ME_sign <- function(MEs, datExpr, colors){
+  out <- MEs
+  for (ME in colnames(MEs)) {
+    col <- sub("^ME","", ME)
+    genes <- names(colors)[colors == col]
+    genes <- intersect(genes, colnames(datExpr))
+    if (length(genes) >= 2) {
+      anchor <- rowMeans(datExpr[rownames(MEs), genes, drop = FALSE])
+      if (suppressWarnings(cor(MEs[[ME]], anchor, use = "pairwise.complete.obs")) < 0)
+        out[[ME]] <- -out[[ME]]
+    }
+  }
+  WGCNA::orderMEs(out)
+}
+
+# Meta restricted to High/Low, plus Steroid flag ----
+meta <- phenoData.subset %>%
+  transmute(
+    T2_Status2 = ifelse(T2_Status %in% c("High","Low"), T2_Status, NA),
+    Steroid    = ifelse(grepl("ACS", patient_type), "Steroid", "NoSteroid")
+  )
+
+# Align meta & MEs and drop NA (Healthy) ----
+common2 <- intersect(rownames(meta), rownames(module_eigengenes))
+meta    <- meta[common2, , drop = FALSE]
+MEs_all <- module_eigengenes[common2, , drop = FALSE]
+meta    <- meta[!is.na(meta$T2_Status2), , drop = FALSE]
+MEs_all <- MEs_all[rownames(meta), , drop = FALSE]
+
+# OPTIONAL: lock ME signs (recommended for consistent plots)
+MEs_all <- align_ME_sign(MEs_all, norm.counts[rownames(MEs_all), , drop = FALSE], module_colors)
+
+# Build 4-group indicator with FIXED order ----
+meta$grp <- factor(paste(meta$T2_Status2, meta$Steroid, sep = "_"),
+                   levels = c("High_Steroid","High_NoSteroid","Low_Steroid","Low_NoSteroid"))
+G <- model.matrix(~ 0 + grp, data = meta)
+colnames(G) <- c("T2High_Steroid","T2High_NoSteroid","T2Low_Steroid","T2Low_NoSteroid")
+
+# Sanity checks (avoid subtle bugs)
+stopifnot(identical(rownames(MEs_all), rownames(G)))
+
+# Correlate MEs (rows=samples) vs subgroup indicators (rows=samples)
+corr_mat <- WGCNA::bicor(MEs_all, G, use = "pairwise.complete.obs")   # modules × 4 groups
+p_mat    <- WGCNA::corPvalueStudent(corr_mat, nrow(MEs_all))
+
+# Plot function ----
+p_subgroups <- {
+  df <- reshape2::melt(corr_mat, varnames = c("Module","Group"), value.name = "Correlation") %>%
+    dplyr::mutate(Module = as.character(Module)) %>%
+    dplyr::group_by(Module) %>% dplyr::mutate(.ord = max(abs(Correlation), na.rm = TRUE)) %>%
+    dplyr::ungroup() %>% dplyr::mutate(Module = forcats::fct_reorder(Module, .ord, .desc = TRUE)) %>%
+    dplyr::select(-.ord)
+  
+  ggplot(df, aes(Group, Module, fill = Correlation)) +
+    geom_tile(color = "black", linewidth = 0.4) +
+    geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3, fontface = "bold") +
+    scale_fill_gradient2(
+      low = "#113F67", mid = "white", high = "#DC143C",
+      midpoint = 0,
+      limits = c(-0.3, 0.3),     # <<< legend & color scale from -0.3 to 0.3
+      oob = scales::squish
+    ) +
+    labs(title = "Modules vs T2-High/Low × Steroid/NoSteroid", x = "", y = "", fill = "r") +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+print(p_subgroups)
+
+
