@@ -1,0 +1,258 @@
+---
+title: "Differential Expression Analysis"
+subtitle: "T2 ICS 300 Project"
+author: "Gouri Anil"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+
+output:
+  html_document:
+    theme: spacelab        # any bs3 theme: cosmo, flatly, readable, etc.
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: "show"
+    self_contained: true
+  pdf_document:
+    toc: true
+    toc_depth: 3
+  word_document:
+    toc: true
+    toc_depth: 3
+
+# Optional metadata (safe to keep for general use)
+keywords: ["analytics", "R Markdown", "report"]
+lang: en-US
+
+# Editor behavior (RStudio/Quarto respects this)
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# Loading packages
+```{r}
+library(edgeR)
+library(dplyr)
+library(stringr)
+library(tibble) 
+library(DESeq2)
+```
+
+# Reading in the data
+```{r}
+counts <- read.csv("/Users/gouri/University of Michigan Dropbox/Gouri Anil/Kozik Lab - Dry Lab/Kozik Lab - Gouri/Consolidated/WGCNA/all_counts.csv")
+
+metadata <- read.csv("/Users/gouri/University of Michigan Dropbox/Gouri Anil/Kozik Lab - Dry Lab/Kozik Lab - Gouri/Consolidated/WGCNA/metadata.csv")
+```
+
+
+```{r}
+# Ensure first column is Gene and clean it
+names(counts)[1] <- "Gene"
+counts <- counts %>%
+  mutate(Gene = str_trim(Gene)) %>%
+  filter(!is.na(Gene), Gene != "")
+
+# Coerce non-Gene columns to numeric
+counts_num <- counts %>%
+  mutate(across(!"Gene", ~ suppressWarnings(as.numeric(.))))
+
+# Sum duplicates (numeric cols only)
+counts_summed <- counts_num %>%
+  dplyr::group_by(Gene) %>%
+  dplyr::summarise(
+    dplyr::across(dplyr::where(is.numeric), ~ sum(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Set rownames = Gene and drop the Gene column
+counts_summed_mat <- counts_summed %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("Gene")
+
+rownames(metadata) <- metadata[,1]
+
+# sanity checks
+stopifnot(is.null(counts_summed_mat$Gene))
+stopifnot(all(!is.na(rownames(counts_summed_mat))))
+
+counts_data <- counts_summed_mat
+head(counts_data)
+```
+
+```{r}
+metadata$status <- factor(metadata$status)
+metadata$T2_Status <- factor(metadata$T2_Status)
+```
+
+```{r}
+# Reorder counts' columns based on row order of metadata
+counts_data <- counts_data[, row.names(metadata)]
+all(rownames(metadata) == colnames(counts_data))
+```
+```{r}
+# made counts as integers
+# Convert all columns to numeric, then to integer matrix
+# keep gene rownames, convert to integer matrix, restore rownames
+rn <- rownames(counts_data)
+
+counts_int <- as.data.frame(lapply(counts_data, function(x) as.numeric(x)))
+counts_int <- round(as.matrix(counts_int), 0)
+rownames(counts_int) <- rn
+storage.mode(counts_int) <- "integer"
+```
+
+# Construct DESeqDataSet
+```{r}
+
+
+# Drop samples with missing T2_Status
+metadata_filtered <- metadata[!is.na(metadata$status), ]
+
+# Subset counts to keep only those samples
+counts_filtered <- counts_int[, rownames(metadata_filtered)]
+
+# Rebuild DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filtered,
+  colData   = metadata_filtered,
+  design    = ~ status
+)
+
+```
+# Pre-filtering
+```{r}
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+```
+
+# Factor levels
+```{r}
+dds$status <- relevel(dds$status, ref = "Healthy")
+```
+
+# Run DESeq
+```{r}
+dds <- DESeq(dds)
+res<- results(dds)
+res
+
+```
+# Log fold change shrinkage
+```{r}
+resultsNames(dds)
+```
+
+```{r}
+resLFC <- lfcShrink(dds, coef = "status_Asthma_vs_Healthy", type = "apeglm")
+
+resLFC
+
+```
+
+```{r}
+resOrdered <- res[order(res$padj),]
+summary(res)
+library(ggplot2)
+library(DESeq2)
+
+# Get data for plotting
+gene_name <- "CXCL8"
+df <- plotCounts(dds, gene = gene_name, intgroup = "status", returnData = TRUE)
+
+# Extract adjusted p-value for that gene from DESeq2 results
+res <- results(dds)
+p_value <- res[gene_name, "padj"]
+
+# Create boxplot with padj annotation
+ggplot(df, aes(x = status, y = count, fill = status)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.2, size = 2, alpha = 0.7) +
+  scale_y_log10() +
+  labs(
+    title = paste0(gene_name, " Expression by Status"),
+    subtitle = paste0("p-value: ", signif(p_value, 3)),
+    x = "Status",
+    y = "Normalized Count (log scale)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, face = "italic"),
+    legend.position = "none"
+  )
+
+```
+
+```{r}
+res <- results(dds)
+
+# Make sure padj is not NA
+res_clean <- res[!is.na(res$padj), ]
+
+# Check the number of genes that are downregulated
+table(res_clean$log2FoldChange < 0)
+
+alpha <- 0.1
+
+down_genes <- subset(res_clean, padj < alpha)
+up_genes   <- subset(res_clean, padj < alpha)
+
+# Diagnostic counts
+cat("Significant genes (padj < 0.05):", sum(res_clean$padj < alpha), "\n")
+cat("Upregulated:", nrow(up_genes), "\n")
+cat("Downregulated:", nrow(down_genes), "\n")
+
+# Peek at down genes
+head(down_genes[order(down_genes$log2FoldChange), ])
+```
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+library(tibble)
+library(dplyr)
+
+alpha <- 0.05
+
+res_df <- as.data.frame(res_clean) %>%
+  rownames_to_column("Gene") %>%
+  mutate(
+    negLog10Padj = -log10(padj),
+    direction = case_when(
+      padj < alpha & log2FoldChange > 0 ~ "Up",
+      padj < alpha ~ "Down",
+      TRUE ~ "NS"
+    )
+  )
+
+# Pick top genes to label
+lab_df <- res_df %>%
+  filter(direction != "NS") %>%
+  arrange(padj) %>%
+  slice_head(n = 10)
+
+# Volcano plot
+ggplot(res_df, aes(x = log2FoldChange, y = negLog10Padj)) +
+  geom_point(aes(color = direction), alpha = 0.7, size = 1.8) +
+  geom_hline(yintercept = -log10(alpha), linetype = "dashed") +
+  geom_text_repel(
+    data = lab_df,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 20
+  ) +
+  scale_color_manual(values = c("Down" = "#2c7bb6", "NS" = "grey70", "Up" = "#d7191c")) +
+  labs(
+    title = paste0("Volcano Plot (padj < ", alpha, ")"),
+    x = "log2 Fold Change",
+    y = expression(-log[10]("padj")),
+    color = "Direction"
+  ) +
+  theme_minimal(base_size = 13)
+
+```

@@ -11,6 +11,7 @@ library(magrittr)
 library(tidyverse)
 library(DESeq2)
 library(ggplot2)
+library(ggrepel)
 ```
 
 
@@ -18,7 +19,7 @@ library(ggplot2)
 Step 2: Load Data and Preprocess it
 ```{r}
 # Counts data
-counts_data <- read.csv("all_counts.csv", stringsAsFactors = FALSE) %>%
+counts_data <- read.csv("/Users/gouri/University of Michigan Dropbox/Gouri Anil/Kozik Lab - Dry Lab/Kozik Lab - Gouri/Consolidated/WGCNA/all_counts.csv", stringsAsFactors = FALSE) %>%
   na.omit() %>%
   group_by(Gene = .[[1]]) %>%
   summarise(across(-1, ~ round(sum(.)))) %>%
@@ -26,7 +27,7 @@ counts_data <- read.csv("all_counts.csv", stringsAsFactors = FALSE) %>%
   {rownames(.) <- .$Gene; .[, -1]}
 
 # Metadata
-metadata <- read.csv("metadata.csv", row.names = 1)
+metadata <- read.csv("/Users/gouri/University of Michigan Dropbox/Gouri Anil/Kozik Lab - Dry Lab/Kozik Lab - Gouri/Consolidated/WGCNA/metadata.csv")
 
 
 # Step 2: Make sure all the row names in the colData matches to the column names in the counts_data
@@ -98,6 +99,7 @@ volcano <- ggplot(res_df, aes(x = log2FoldChange, y = neglog10_pvalue, color = t
        y = "-Log10(P-value)") +
   theme_minimal()
 volcano
+summary(res)
 ```
 Step 4: T2_Hgh and T2_Low 
 ```{r}
@@ -254,7 +256,7 @@ res_asthma_ICS_df$threshold[res_asthma_ICS_df$padj < 0.1 & res_asthma_ICS_df$log
 top_up_ICS_asthma <- res_asthma_ICS_df[res_asthma_ICS_df$padj < 0.1 & res_asthma_ICS_df$log2FoldChange > 1, ]
 top_up_ICS_asthma <- top_up_ICS_asthma[order(top_up_ICS_asthma$padj), ][1:min(15, nrow(top_up_ICS_asthma)), ]
 
-top_down_ICS_asthma <- res_asthma_ICS_df[res_asthma_ICS_df$padj < 0.1 & res_asthma_ICS_df$log2FoldChange < -1, ]
+top_down_ICS_asthma <- res_asthma_ICS_df[res_T2Low_ICS_df$padj < 0.1 & res_asthma_ICS_df$log2FoldChange < -1, ]
 top_down_ICS_asthma <- top_down_ICS_asthma[order(top_down_ICS_asthma$padj), ][1:min(15, nrow(top_down_ICS_asthma)), ]
 
 top_genes_ICS_asthma <- rbind(top_up_ICS_asthma, top_down_ICS_asthma)
@@ -294,11 +296,11 @@ library(ggrepel)
 # Ensure your metadata has a column for ICS use (e.g., "ICS_Status")
 # Here we assume the ICS status is stored in the metadata column 'ICS_Status', where 'Yes' means ICS use and 'No' means no ICS use
 
-# Step 1: Filter data for T2 High samples
+# Step 1: Filter data for T2 Low samples
 t2_high_metadata <- metadata[metadata$T2_Group == "High", ]
 t2_high_counts <- counts_data[, colnames(counts_data) %in% rownames(t2_high_metadata)]
 
-# Step 2: Create DESeq2 dataset for T2 High samples with ICS use vs no ICS use
+# Step 2: Create DESeq2 dataset for T2 Low samples with ICS use vs no ICS use
 dds_T2High_ICS <- DESeqDataSetFromMatrix(countData = t2_high_counts,
                                          colData = t2_high_metadata,
                                          design = ~ Patient_Type)
@@ -326,7 +328,7 @@ dds_T2High_ICS_df$threshold[dds_T2High_ICS_df$padj < 0.1 & dds_T2High_ICS_df$log
 top_up_ICS_T2High <- dds_T2High_ICS_df[dds_T2High_ICS_df$padj < 0.1 & dds_T2High_ICS_df$log2FoldChange > 1, ]
 top_up_ICS_T2High <- top_up_ICS_T2High[order(top_up_ICS_T2High$padj), ][1:min(15, nrow(top_up_ICS_T2High)), ]
 
-top_down_ICS_T2High <- dds_T2High_ICS_df[dds_T2High_ICS_df$padj < 0.1 & dds_T2High_ICS_df$log2FoldChange < -1, ]
+top_down_ICS_T2High <- res_T2Low_ICS_df[res_T2Low_ICS_df$padj < 0.1 & res_T2Low_ICS_df$log2FoldChange < -1, ]
 top_down_ICS_T2High <- top_down_ICS_T2High[order(top_down_ICS_T2High$padj), ][1:min(15, nrow(top_down_ICS_T2High)), ]
 
 top_genes_ICS_T2High <- rbind(top_up_ICS_T2High, top_down_ICS_T2High)
