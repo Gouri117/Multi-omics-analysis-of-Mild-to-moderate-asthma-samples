@@ -33,17 +33,17 @@ Raw data files are not publicly included due to privacy restrictions.
 * Visualization using volcano plots and heatmaps
 
 3. Co-expression Network Analysis (WGCNA)
-* Construction of scale-free gene co-expression networks
-* Identification of gene modules
-* Calculation of:
+i) Construction of scale-free gene co-expression networks
+ii) Identification of gene modules
+iii) Calculation of:
 - Module eigengenes (ME)
 - Module membership (MM)
 - Gene significance (GS)
-* Correlation of modules with:
+iv) Correlation of modules with:
 - T2 status
 - ICS use
 - Combined phenotypes
-4. Functional Enrichment
+v) Functional Enrichment
 * GO and pathway enrichment for key modules
 * Biological interpretation of module-level behavior
 * Identification of hub genes within clinically relevant modules
