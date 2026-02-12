@@ -21,32 +21,33 @@ The analysis combines differential expression, network-based methods (WGCNA), an
 Raw data files are not publicly included due to privacy restrictions.
 
 ## Analysis Workflow
-1. Preprocessing
-* Quality control and filtering of low-count genes
-* Variance-stabilizing transformation (VST)
-* Sample and gene QC checks
+* Preprocessing
+  1. Quality control and filtering of low-count genes
+  2. Variance-stabilizing transformation (VST)
+  3. Sample and gene QC checks
 
-2. Differential Expression
-* T2-high vs T2-low
-* ICS vs No ICS
-* Stratified contrasts (e.g., T2-high + ICS vs T2-high without ICS)
-* Visualization using volcano plots and heatmaps
+* Differential Expression
+  1. T2-high vs T2-low
+  2. ICS vs No ICS
+  3. Stratified contrasts (e.g., T2-high + ICS vs T2-high without ICS)
+  4. Visualization using volcano plots and heatmaps
 
-3. Co-expression Network Analysis (WGCNA)
-Step 1: Construction of scale-free gene co-expression networks
-Step 2: Identification of gene modules 
-iii) Calculation of:
-- Module eigengenes (ME)
-- Module membership (MM)
-- Gene significance (GS)
-iv) Correlation of modules with:
-- T2 status
-- ICS use
-- Combined phenotypes
-v) Functional Enrichment
-* GO and pathway enrichment for key modules
-* Biological interpretation of module-level behavior
-* Identification of hub genes within clinically relevant modules
+* Co-expression Network Analysis (WGCNA)
+  1. Construction of scale-free gene co-expression networks
+  2. Identification of gene modules
+  3. Calculation of:
+     * Module eigengenes (ME)
+     * Module membership (MM)
+     * Gene significance (GS)
+* Correlation of modules with:
+ 1. T2 status
+ 2. ICS use
+ 3. Combined phenotypes
+    
+* Functional Enrichment
+  1. GO and pathway enrichment for key modules
+  2. Biological interpretation of module-level behavior
+  3. Identification of hub genes within clinically relevant modules
 
 ## Key Questions Addressed
 
